@@ -6,12 +6,8 @@ Drop-in replacement for ExllamaLinearKernel on RDNA2. The HIP kernel lives in
 ``csrc/rocm/q_gemm_rdna2.cu`` and is exposed via
 ``torch.ops._rocm_C.gptq_gemm_rdna2``.
 
-gfx1030 has no ``v_dot2_f32_bf16`` (that landed on RDNA3, gfx1100+), and the
-bf16 path using ``v_dot2c_f32_f16`` with bit-reinterpreted bf16 inputs was
-numerically broken (the IEEE fp16→fp32 promotion the hardware performs on
-bf16 bit patterns is not equivalent to the bf16→fp32 promotion, and the
-difference is exponent-dependent — a single bias correction cannot cancel
-it). We restrict to fp16 only. bf16-trained checkpoints should be quantized
+gfx1030 has no ``v_dot2_f32_bf16`` (that landed on RDNA3, gfx1100+),
+We restrict to fp16 only. bf16-trained checkpoints should be quantized
 to fp16. RDNA3 (gfx1100) has a separate kernel that retains the bf16 path
 — see ``q_gemm_rdna3.cu`` in the upstream tree.
 
@@ -193,7 +189,14 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
         assert w_zp is not None, "Zero points are required by RDNA2 W4A16"
         assert w_g_idx is not None, "g_idx tensor (possibly empty) required"
 
-        output = ops.gptq_gemm_rdna2(x_2d, w_q, w_zp, w_s, w_g_idx, False)
+        # M-cap from microbench: RDNA2 wins up to M=96 (ratio 0.85, 18%
+        # margin), Triton wins from M=128 (ratio 1.15, 15% loss).
+        if x_2d.shape[0] <= 96:
+            output = ops.gptq_gemm_rdna2(x_2d, w_q, w_zp, w_s, w_g_idx, False)
+        else:
+            output = ops.gptq_gemm(
+                x_2d, w_q, w_zp, w_s, w_g_idx, True, False, c.weight_type.size_bits
+            )
 
         if bias is not None:
             output.add_(bias)
