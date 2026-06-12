@@ -1,30 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 //
-// W4A16 GPTQ kernel for RDNA2 (gfx1030 class), templated on the
-// activation dtype (half). Adapted from W4A16 GPTQ kernel
-// for RDNA3 (csrc/rocm/q_gemm_rdna3.cu) with the following changes:
+// W4A16 GPTQ kernel for RDNA2 (gfx1030 class), fp16. Adapted from
+// W4A16 GPTQ kernel for RDNA3 (csrc/rocm/q_gemm_rdna3.cu):
 //
-//   1. Decode only. M_COUNT ∈ {1, 2, 4, 8} covers M ∈ [1, 15] in
-//      tiles; M >= 16 (prefill) is not in scope and falls through to
-//      Triton W4A16. gfx1030 has no WMMA ISA (that landed on RDNA3,
-//      gfx1100+), so the prefill path on gfx1030 is Triton regardless.
+//   1. Decode only. M_COUNT ∈ {1, 2, 4, 8} covers M ∈ [1, 15] in tiles.
+//      The Python dispatcher in rdna2_w4a16.py caps use at M=96 (microbench
+//      crossover); M > 96 falls through to Triton W4A16. gfx1030 has no
+//      WMMA ISA (that landed on RDNA3, gfx1100+).
 //
 //   2. Direct write to f16 output via packed CAS-loop on a 64-bit
 //      word (atomic_add_pk4_f16). gfx1030 has no native
 //      v_global_atomic_pk_add_f16, so the kernel emulates one with
-//      global_atomic_cmpswap_b64. This avoids the M*N*4-byte FP32 scratch
-//      buffer + memset + cast-pass that an fp32-accumulator design would
-//      need; the caller passes a zero-initialised f16 output tensor
-//      and every block atomically adds its partial sum into it.
+//      global_atomic_cmpswap_b64. Caller passes a zero-initialised f16
+//      output tensor and every block atomically adds its partial sum.
 //
-//   3. Wave32 geometry sized for high CU saturation: THREADS_X=256
-//      (8 waves per block) and BLOCK_KN_SIZE=256, with each thread
-//      computing 4 N output columns. gridDim.z = K / BLOCK_KN_SIZE
-//      splits K and the output is atomically accumulated. fp16 uses
-//      v_dot2_f32_f16 (__builtin_amdgcn_fdot2) directly. M_COUNT ∈ {1, 2,
-//      4, 8} is selected at launch based on size_m; M >= 16 falls
-//      through to Triton.
+//   3. Wave32 geometry: THREADS_X=256 (8 waves per block),
+//      BLOCK_KN_SIZE=256, each thread computes 4 N output columns.
 
 #include <cstdint>
 #include <cstdio>
@@ -50,14 +42,6 @@ namespace gptq_rdna2 {
 // halves gridDim.z (32 → 16) and therefore halves the atomic count per
 // output position vs the exllama default. THREADS_X=256 = 8 waves on RDNA2
 // wave32; with ~32 wave slots per CU we still fit 4 blocks per CU at peak.
-//
-// We tried BLOCK_KN_SIZE=512 (microbench on Qwen3.6-27B): bf16 improved
-// 5-10% at large M (atomic CAS halved), but fp16 decode regressed up to
-// +40% on qkv-square (32 → 45 μs at M=1). Cause: 16 waves/block × 16
-// total blocks for [M=1, K=N=4096] only saturates ~8 of the 96 CUs,
-// breaking memory-latency hiding for the fp16 path which is already
-// memory-bound. Reverted to 256; bf16 keeps most of its gains from the
-// fp32 dequant rewrite alone.
 #define BLOCK_KN_SIZE 256
 #define THREADS_X 256
 
@@ -196,15 +180,11 @@ __global__ void gemm_q4_kernel_rdna2(
   // are zero-padded so the dot product contribution is 0 (we then skip the
   // atomic write for those rows below).
   //
-  // M=1 fast path: skip LDS staging + __syncthreads entirely. All 256 threads
-  // read the SAME 8-element A window per inner step (a_off is uniform across
-  // the block), so the cache-line broadcast through L1 makes global reads as
-  // cheap as LDS reads. Measured: ~1% on 4B b=1, ~6% on 27B b=1 in=128.
-  static_assert(BLOCK_KN_SIZE == THREADS_X,
-                "BLOCK_KN_SIZE must equal THREADS_X (1 K element per thread)");
   // The fp16 inner loop indexes block_a[m][a_off] unconditionally, so we MUST
   // stage A through LDS even at M=1 to avoid reading uninitialized shared
   // memory.
+  static_assert(BLOCK_KN_SIZE == THREADS_X,
+                "BLOCK_KN_SIZE must equal THREADS_X (1 K element per thread)");
   if (offset_k + t < end_k) {
 #pragma unroll
     for (int m = 0; m < M_COUNT; ++m) {
@@ -277,7 +257,7 @@ __global__ void gemm_q4_kernel_rdna2(
   // before any dequant/FMA depends on them. This gives the AMDGPU backend
   // freedom to schedule the global_loads early and overlap their latency
   // with dequant + v_pk_fma_f16 of earlier iterations. Cost: 4×int4 = 16
-  // VGPRs in flight per thread, plenty of headroom on RDNA2.
+  // VGPRs in flight per thread.
   int k = offset_k;
   while (k < end_k) {
     if (k == nextgroup) {
