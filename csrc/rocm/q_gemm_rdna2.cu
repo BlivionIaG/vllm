@@ -4,10 +4,9 @@
 // W4A16 GPTQ kernel for RDNA2 (gfx1030 class), fp16. Adapted from
 // W4A16 GPTQ kernel for RDNA3 (csrc/rocm/q_gemm_rdna3.cu):
 //
-//   1. Decode only. M_COUNT ∈ {1, 2, 4, 8} covers M ∈ [1, 15] in tiles.
-//      The Python dispatcher in rdna2_w4a16.py caps use at M=96 (microbench
-//      crossover); M > 96 falls through to Triton W4A16. gfx1030 has no
-//      WMMA ISA (that landed on RDNA3, gfx1100+).
+//   1. M_COUNT ∈ {1, 2, 4, 8} covers M ∈ [1, 15] in tiles; larger M uses
+//      M_COUNT=8 and is correct but leaves throughput on the table.
+//      gfx1030 has no WMMA ISA (that landed on RDNA3, gfx1100+).
 //
 //   2. Direct write to f16 output via packed CAS-loop on a 64-bit
 //      word (atomic_add_pk4_f16). gfx1030 has no native
@@ -50,8 +49,7 @@ namespace gptq_rdna2 {
 #if defined(__HIP__RDNA2__) || !defined(__HIP_DEVICE_COMPILE__)
 
 // ---------------------------------------------------------------------------
-// Per-dtype helpers. We avoid heavy template metaprogramming and just provide
-// overloaded inline functions; the kernel below selects via `if constexpr`.
+// Per-dtype helpers.
 // ---------------------------------------------------------------------------
 
 // Type-generic zero — half in HIP/ROCm has a converting constructor from
@@ -66,19 +64,10 @@ __forceinline__ __device__ half tzero<half>() {
 }
 
 __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
-  // RDNA2 has v_dot2_f32_f16 (`__builtin_amdgcn_fdot2`) which computes
-  // fp32 += a.x*b.x + a.y*b.y in a single instruction with the accumulator
-  // staying in fp32 throughout. hipcc 7.2 does NOT peephole the obvious
-  // `__hfma2 + cast + add` pattern into v_dot2 (verified by ISA
-  // disassembly: 0 v_dot2_f32_f16 vs 256 v_cvt_f32_f16 + 218 v_add_f32 in
-  // the M_COUNT=8 kernel before this change), so we issue the builtin
-  // explicitly. Saves the trailing 2× v_cvt_f32_f16 + v_add_f32 (3 ops)
-  // per dot22_8_f call vs the half2-accumulator form. With 128 calls per
-  // K=32 step that's ~384 ops/K-step less issue pressure on the VALU.
-  //
-  // Numerical bonus: accumulator stays fp32 throughout the dot. The old
-  // form accumulated 8 muladds in fp16 (10-bit mantissa) before casting,
-  // which could lose ~3 bits of precision on borderline magnitudes.
+  // Use v_dot2_f32_f16 explicitly. hipcc does not lower the obvious
+  // hfma2+cast+add pattern to v_dot2 on gfx1030, and keeping the
+  // accumulator in fp32 avoids the ~3 bits of precision loss from
+  // accumulating in fp16.
   float result = 0.0f;
   const half2* a2_ptr = (const half2*)a_ptr;
   #pragma unroll
@@ -88,23 +77,11 @@ __forceinline__ __device__ float dot22_8_f(half2 (&dq)[4], const half* a_ptr) {
   return result;
 }
 
-// ---------------------------------------------------------------------------
 // Packed atomic-add via CAS-loop on a 64-bit word (4 fp16 lanes per CAS).
 // RDNA2 (gfx1030) does NOT have native v_global_atomic_pk_add_f16 (that
 // landed on gfx940), so this lowers to global_atomic_cmpswap_b64 plus retry.
-// We use this in the kernel epilogue to write 4 output columns per row in a
-// single atomic operation — half the atomic instruction count and half the
-// contention vs two 32-bit CAS calls.
-//
-// Writing directly to fp16 (instead of through an FP32 scratch buffer + cast
-// pass) saves M*N*4 bytes of allocation, the memset, and the epilogue cast
-// pass that an fp32-accumulator design would need.
-//
-// 64-bit alignment: the kernel writes at `out + n` where n = offset_n + t*4
-// (always multiple of 4), and partition_weight_shape[1] is required to be a
-// multiple of 8 by can_implement(), so every (m, n) write target is 8-byte
-// aligned. Required by global_atomic_cmpswap_b64.
-// ---------------------------------------------------------------------------
+// Writes 4 output columns per row in one atomic op. The (m, n) target is
+// 8-byte aligned because n is a multiple of 4 and N is a multiple of 8.
 
 __forceinline__ __device__ void atomic_add_pk4_f16(half* addr, half2 v01,
                                                    half2 v23) {
@@ -124,10 +101,8 @@ __forceinline__ __device__ void atomic_add_pk4_f16(half* addr, half2 v01,
   }
 }
 
-// Load one row's worth of 4 packed zeros (column n..n+3) from a [groups, N/8]
-// uint32 tensor. n is a multiple of 4 by construction (n = offset_n + t*4 with
-// offset_n = blockIdx.x * BLOCK_KN_SIZE * 4), so the 4 nibbles always live within one or two
-// uint32 words; in practice within one because n & 7 is 0 or 4.
+// Load one row's worth of 4 packed zeros (columns n..n+3) from a [groups, N/8]
+// uint32 tensor. n is a multiple of 4, so the 4 nibbles fit in one uint32.
 __forceinline__ __device__ void load4_zeros(const uint32_t* qzeros_row, int n,
                                             int (&zeros)[4]) {
   int qcol = n / 8;
@@ -165,24 +140,15 @@ __global__ void gemm_q4_kernel_rdna2(
   const int end_k = min(offset_k + BLOCK_KN_SIZE, size_k);
   const int n = offset_n + t * 4;
 
-  // LDS layout: [M_COUNT][BLOCK_KN_SIZE + LDS_PAD]. The PAD=8 elements per M
-  // row break the natural 256-element/512-byte alignment that would otherwise
-  // collide on the same LDS bank when a thread reads block_a[0..M_COUNT-1][k]
-  // (same k, different m). Row stride becomes 264 elements * 2B = 528B = 132
-  // 4-byte banks, so m-stride hits banks (m*132)%32 = (m*4)%32 — distinct for
-  // all M_COUNT ≤ 8. Cost: 16B LDS per block, irrelevant.
+  // LDS layout: [M_COUNT][BLOCK_KN_SIZE + LDS_PAD]. PAD=8 avoids bank
+  // conflicts when different M rows read the same K offset. Cost: 16B LDS
+  // per block, negligible.
   constexpr int LDS_PAD = 8;
   __shared__ T block_a[M_COUNT][BLOCK_KN_SIZE + LDS_PAD];
 
-  // Stage A: each thread loads 1 K element per M row into LDS (with optional
-  // act-order permutation). THREADS_X == BLOCK_KN_SIZE so this is a 1:1 map.
-  // For M_COUNT > 1 with size_m not a multiple of M_COUNT, slots past size_m
-  // are zero-padded so the dot product contribution is 0 (we then skip the
-  // atomic write for those rows below).
-  //
-  // The fp16 inner loop indexes block_a[m][a_off] unconditionally, so we MUST
-  // stage A through LDS even at M=1 to avoid reading uninitialized shared
-  // memory.
+  // Stage A into LDS: each thread loads one K element per M row. Invalid
+  // rows past size_m are zero-padded. LDS staging is required even at M=1
+  // because the inner loop indexes block_a[m][a_off] unconditionally.
   static_assert(BLOCK_KN_SIZE == THREADS_X,
                 "BLOCK_KN_SIZE must equal THREADS_X (1 K element per thread)");
   if (offset_k + t < end_k) {
@@ -246,18 +212,9 @@ __global__ void gemm_q4_kernel_rdna2(
     for (int j = 0; j < 4; ++j) block_c[m][j] = 0.0f;
   }
 
-  // Note on group-transition granularity: we check `k == nextgroup` at the
-  // start of each outer iteration (which advances K by 32). This is correct
-  // when group_size >= 32 OR group_size divides 32 evenly (groupsize is one
-  // of {1,2,4,8,16,32,64,128,...}). For group_size in {16, 8, 4, ...} the
-  // inner loop would cross a group boundary between j-iterations; we require
-  // group_size >= 32 here, mirroring exllama's assumption.
-  //
-  // Software pipelining: we issue all 4 vectorized weight loads up front
-  // before any dequant/FMA depends on them. This gives the AMDGPU backend
-  // freedom to schedule the global_loads early and overlap their latency
-  // with dequant + v_pk_fma_f16 of earlier iterations. Cost: 4×int4 = 16
-  // VGPRs in flight per thread.
+  // Group transitions are checked at K-block granularity; we require
+  // groupsize >= 32 (mirrors exllama). Prefetch 4 weight words ahead of
+  // dequant/FMA to hide global load latency.
   int k = offset_k;
   while (k < end_k) {
     if (k == nextgroup) {
@@ -298,11 +255,8 @@ __global__ void gemm_q4_kernel_rdna2(
     k += 32;  // 4 weight words * 8 nibbles = 32 K elements
   }
 
-  // Pack the 4 FP32 partial sums into 2 packed pairs and atomically add all
-  // four lanes in a single 64-bit CAS write directly to the fp16 output
-  // (caller pre-zeros it). On gfx1030 the packed atomic is a CAS-loop, but
-  // with a single b64 op we halve the atomic instruction count vs two b32
-  // CAS calls, AND save the FP32 buffer + memset + cast pass entirely.
+  // Pack partial sums into two half2 pairs and atomically add to the
+  // zero-initialized fp16 output.
   #pragma unroll
   for (int m = 0; m < M_COUNT; ++m) {
     if (offset_m + m >= size_m) continue;  // skip padding rows past size_m
@@ -344,19 +298,10 @@ void launch_gemm_q4_for_mcount(const T* a, const uint32_t* b_q_weight,
       a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
       zero_offset, b_q_perm);
 }
-// Dispatch to the largest M_COUNT template that doesn't waste more than
-// half a tile. Caps at 8: above that, larger M_COUNT wastes too many
-// thread slots; the public entry point's caller is expected to dispatch
-// M >= 16 to a separate path (Triton W4A16 on gfx1030, since gfx1030 has
-// no WMMA).
-//
-// Tile-waste table:
-//   M=1   -> M_COUNT=1   (no waste)
-//   M=2,3 -> M_COUNT=2   (M=3 wastes 1/2 of last tile)
-//   M=4-7 -> M_COUNT=4   (worst case M=5: wastes 3/4 of last tile)
-//   M=8-15-> M_COUNT=8   (worst case M=9: wastes 7/8 of last tile)
-// "Wasted" rows are zero-padded in LDS and skip the atomic write, so they
-// only burn instructions on the last block, never affect correctness.
+// Dispatch to the largest M_COUNT template that tiles size_m without wasting
+// more than half the last tile. M_COUNT is capped at 8; the kernel still
+// produces correct output for M >= 16 but is decode-optimized, not a prefill
+// GEMM.
 template <typename T>
 void launch_gemm_q4(const T* a, const uint32_t* b_q_weight,
                     const uint32_t* b_qzeros, const T* b_scales,
@@ -378,10 +323,9 @@ void launch_gemm_q4(const T* a, const uint32_t* b_q_weight,
                                     c, size_m, size_n, size_k, groups,
                                     zero_offset, stream);
   } else {
-    // M_COUNT=8 covers M in [8, 15]. For M >= 16, the public entry
-    // point's caller should dispatch to a separate path; this kernel
-    // still produces correct output but the scalar dot-product path
-    // is unlikely to be throughput-competitive at large M.
+    // M_COUNT=8 covers M in [8, 15] and all larger M. The kernel is correct
+    // but decode-optimized; throughput at large M is intentionally left to
+    // a separate prefill GEMM when available.
     launch_gemm_q4_for_mcount<T, 8>(a, b_q_weight, b_qzeros, b_scales, b_q_perm,
                                     c, size_m, size_n, size_k, groups,
                                     zero_offset, stream);

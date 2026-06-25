@@ -189,14 +189,7 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
         assert w_zp is not None, "Zero points are required by RDNA2 W4A16"
         assert w_g_idx is not None, "g_idx tensor (possibly empty) required"
 
-        # M-cap from microbench: RDNA2 wins up to M=96 (ratio 0.85, 18%
-        # margin), Triton wins from M=128 (ratio 1.15, 15% loss).
-        if x_2d.shape[0] <= 96:
-            output = ops.gptq_gemm_rdna2(x_2d, w_q, w_zp, w_s, w_g_idx, False)
-        else:
-            output = ops.gptq_gemm(
-                x_2d, w_q, w_zp, w_s, w_g_idx, True, False, c.weight_type.size_bits
-            )
+        output = ops.gptq_gemm_rdna2(x_2d, w_q, w_zp, w_s, w_g_idx, False)
 
         if bias is not None:
             output.add_(bias)
