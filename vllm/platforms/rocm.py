@@ -994,10 +994,7 @@ class RocmPlatform(Platform):
 
     @classmethod
     def num_compute_units(cls, device_id: int = 0) -> int:
-        cu = torch.cuda.get_device_properties(device_id).multi_processor_count
-        if on_gfx1x() or on_gfx10x():
-            cu *= 2
-        return cu
+        return torch.cuda.get_device_properties(device_id).multi_processor_count
 
     @classmethod
     def use_custom_op_collectives(cls) -> bool:
