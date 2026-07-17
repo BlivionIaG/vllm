@@ -93,6 +93,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "int sliding_window) -> Tensor");
   rocm_ops.impl("fa_rdna2_prefill_paged_varlen_splitk", torch::kCUDA,
                 &fa_rdna2_prefill_paged_varlen_splitk);
+
+  rocm_ops.def(
+      "moe_gptq_gemm_rdna2(Tensor a, Tensor(a!) c, Tensor b_q_weight, "
+      "Tensor(a) b_scales, Tensor b_qzeros, Tensor(a) topk_weights, "
+      "Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, "
+      "int top_k, int block_size_m, bool mul_topk_weight, "
+      "int output_topk) -> ()");
+  rocm_ops.impl("moe_gptq_gemm_rdna2", torch::kCUDA, &moe_gptq_gemm_rdna2);
 #endif
 
 #ifdef VLLM_ROCM_GFX1100

@@ -76,10 +76,8 @@ constexpr int BC = 64;
 constexpr int BC_256 = 32;
 constexpr int MAX_SPLITS = 16;
 constexpr int BR_PREFILL = 16;
-constexpr int HEAD_PREFILL = 128;
 constexpr int THREADS_PREFILL = 128;
 constexpr int HEAD_DIM_PAGED_128 = 128;
-constexpr int HEAD_DIM_PAGED_256 = 256;
 __device__ __forceinline__ float fdot2(half2 q, half2 k, float acc) {
   return __builtin_amdgcn_fdot2(q, k, acc, false);
 }
@@ -2394,14 +2392,17 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(
   auto half_opts = torch::TensorOptions().dtype(torch::kHalf).device(Q.device());
   auto float_opts = torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
   auto O = torch::empty({num_tokens, H_q, D}, half_opts);
-  // Partial layout: [N, H_q, BR_PREFILL, kv_splits, D] — each query row in
-  // a BR_PREFILL block gets its own slot so the reduction kernel can combine
-  // partials per-row across splits.
-  auto O_partial = torch::empty({num_tokens, H_q, BR_PREFILL,
+  // Partial layout: [N, H_q, kv_splits, D] — each query token owns one
+  // slot per (head, kv_split). The splitk kernel indexes
+  //   ((token_idx * H_q + h_q) * kv_splits + split) * D + t
+  // which matches this layout. (The earlier [N, H_q, BR_PREFILL, kv_splits,
+  // D] shape allocated BR_PREFILL extra rows per token, wasting
+  // BR_PREFILL x memory and OOM-ing at 16k prefill with cudagraphs.)
+  auto O_partial = torch::empty({num_tokens, H_q,
                                  (int)kv_splits, D}, float_opts);
-  auto M_partial = torch::empty({num_tokens, H_q, BR_PREFILL,
+  auto M_partial = torch::empty({num_tokens, H_q,
                                  (int)kv_splits}, float_opts);
-  auto L_partial = torch::empty({num_tokens, H_q, BR_PREFILL,
+  auto L_partial = torch::empty({num_tokens, H_q,
                                  (int)kv_splits}, float_opts);
 
   const int max_q_blocks = (num_tokens + BR_PREFILL - 1)
