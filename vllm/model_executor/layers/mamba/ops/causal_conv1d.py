@@ -128,7 +128,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         x_ptr + sequence_start_index * stride_x_token + idx_feats * stride_x_dim
     )  # [BLOCK_N,]
 
-    # cache_idx
+        # cache_idx
     conv_states_input_coord = tl.load(
         conv_state_indices_ptr + idx_seq * stride_cache_indices + conv_state_init_index
     ).to(tl.int64)
@@ -137,11 +137,20 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         if conv_states_input_coord == null_block_id:
             # not processing as this is a null block (padding)
             return
+    # Bounds check: if cache_indices points outside the conv_states buffer,
+    # bail out before computing pointers. Without this guard, stale/wrong
+    # state_indices_tensor entries from the drafter path produce
+    # hipErrorIllegalAddress in causal_conv1d on RDNA3 (par1-cs13).
+    if conv_states_input_coord < 0 or conv_states_input_coord >= num_cache_lines:
+        return
     conv_states_base = (
         conv_states_ptr
         + (conv_states_input_coord * stride_conv_state_seq)
         + (idx_feats * stride_conv_state_dim)
     )  # [BLOCK_N,]
+
+
+
 
     w_base = w_ptr + (idx_feats * stride_w_dim)  # [BLOCK_N,]
 
