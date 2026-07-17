@@ -39,6 +39,7 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     scale,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
+    num_blocks_g: tl.int64,  # bounds-check guard for SSM state indices (RDNA3 fix)
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -236,6 +237,7 @@ def fused_recurrent_gated_delta_rule_fwd(
         scale=scale,
         N=N,
         T=T,
+        num_blocks_g=initial_state.shape[0],
         B=B,
         H=H,
         HV=HV,
@@ -270,6 +272,7 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     ht,
     ssm_state_indices,
     scale,
+    num_blocks_g: tl.int64,  # bounds-check guard for SSM state indices (RDNA3 fix)
     stride_mixed_qkv_tok: tl.constexpr,
     stride_a_tok: tl.constexpr,
     stride_b_tok: tl.constexpr,
@@ -464,6 +467,7 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         ht=initial_state,
         ssm_state_indices=ssm_state_indices,
         scale=scale,
+        num_blocks_g=initial_state.shape[0],
         stride_mixed_qkv_tok=stride_mixed_qkv_tok,
         stride_a_tok=stride_a_tok,
         stride_b_tok=stride_b_tok,

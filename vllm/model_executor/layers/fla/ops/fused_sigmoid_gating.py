@@ -40,6 +40,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     scale,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
+    num_blocks_g: tl.int64,  # bounds-check guard for SSM state indices (RDNA3 fix)
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -261,6 +262,7 @@ def fused_sigmoid_gating_delta_rule_update(
         scale=scale,
         N=N,
         T=T,
+        num_blocks_g=initial_state.shape[0],
         B=B,
         H=H,
         HV=HV,
