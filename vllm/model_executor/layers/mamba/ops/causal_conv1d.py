@@ -824,6 +824,10 @@ def _causal_conv1d_update_kernel(
         if conv_states_input_coord == null_block_id:
             # not processing as this is not the actual sequence
             return
+    # Bounds check against the actual conv_states buffer (par1-cs13
+    # / RDNA3 fix). See the matching guard in _causal_conv1d_fwd_kernel.
+    if conv_states_input_coord < 0 or conv_states_input_coord >= num_cache_lines:
+        return
 
     if IS_VARLEN:
         query_start_index = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)

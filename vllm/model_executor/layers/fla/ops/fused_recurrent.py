@@ -106,12 +106,18 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
             else:
                 i_t = 0
-            # Load state index and check for invalid entries
+            # Load state index and check for invalid entries.
+            # NULL_BLOCK_ID=0 collides with the real block-0 cache slot,
+            # so the original `state_idx <= 0` check silently skipped
+            # sequences whose state actually lived in block 0 — those
+            # requests got all-zero output instead of the real SSM state.
+            # The bounds check against num_blocks_g (passed as a runtime
+            # arg) is the only reliable way to distinguish real blocks
+            # from padding.
             state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
                 tl.int64
             )
-            # Skip if state index is invalid (NULL_BLOCK_ID=0)
-            if state_idx <= 0:
+            if state_idx < 0 or state_idx >= num_blocks_g:
                 return
             p_h0 = h0 + state_idx * stride_init_state_token
         else:
@@ -292,8 +298,8 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq).to(tl.int64)
     p_o = o + (i_n * HV + i_hv) * V + o_v
 
-    # Skip if state index is invalid (NULL_BLOCK_ID=0)
-    if state_idx <= 0:
+    # Same NULL_BLOCK_ID=0 collision fix as the read kernel above.
+    if state_idx < 0 or state_idx >= num_blocks_g:
         zero = tl.zeros([BV], dtype=tl.float32).to(p_o.dtype.element_ty)
         tl.store(p_o, zero, mask=mask_v)
         return
