@@ -8,12 +8,19 @@ dispatch logic. The kernel itself lives in ``csrc/rocm/fa_rdna2.cu`` and
 is loaded by ``vllm/v1/attention/ops/fa_rdna2_backend.py`` via
 ``torch.utils.cpp_extension.load_inline`` (already wired in tree).
 
+Selection mechanism:
+  * Registered as ``AttentionBackendEnum.RDNA_ATTN`` in
+    ``vllm/v1/attention/backends/registry.py``.
+  * Selectable via the vLLM CLI ``--attention-backend RDNA_ATTN`` on
+    gfx1030. ``is_available()`` returns False elsewhere, so the
+    backend is a no-op on other architectures.
+  * When the FA-RDNA2 7-gate conditions aren't met for a given forward
+    pass, raises ``NotImplementedError`` so the V1 worker falls through
+    to ROCM_ATTN (which keeps its existing Triton fallback chain).
+
 Scope (strict — ONLY FA-RDNA2-adjacent surfaces touched by this file):
   * new file `vllm/v1/attention/backends/rdna_attn.py` (this one)
-  * runtime patch on `vllm.v1.attention.selector` so the V1 selector
-    prefers RDNA_ATTN on gfx1030 + VLLM_USE_RDNA2_FA=1
-  * optional 1-line edit in `backends/registry.py` to add
-    AttentionBackendEnum.RDNA_ATTN (user applies separately)
+  * 1-line enum entry in `backends/registry.py` (RDNA_ATTN)
   * NO edits to rocm_attn.py, W4A16 GEMM kernels, MoE dispatcher,
     envs.py, platforms/rocm.py, or any other "fix" on the project
 
@@ -573,43 +580,12 @@ class RdnaAttentionBackend(AttentionBackend):
 
 
 # ---------------------------------------------------------------------------
-# Runtime selector favor — best-effort, no global state mutation outside
-# vLLM's selector module-level dicts.
+# Import-time pre-warm of the FA-RDNA2 kernel module so the first forward
+# doesn't pay the load_inline cost. Mirrors what rocm_attn does at import
+# time on the first call.
 # ---------------------------------------------------------------------------
-def _register_with_selector() -> None:
-    """Tell vLLM's V1 AttentionSelector to prefer RDNA_ATTN first.
-
-    If the selector doesn't expose ``_FAVOR_BACKENDS``, this is a
-    no-op and the user wires the optional 1-line enum entry in
-    ``backends/registry.py`` instead. Either path makes RDNA_ATTN
-    reachable.
-    """
-    try:
-        from vllm.v1.attention import selector as _sel  # type: ignore
-    except Exception as exc:
-        logger.debug("RDNA_ATTN selector patch skipped: %s", exc)
-        return
-
-    if not is_available():
-        return  # don't favor a backend that's not usable on this device
-
-    # Prefer RDNA_ATTN ahead of TRITON_ATTN / FLASH_ATTN on gfx1030.
-    favor = getattr(_sel, "_FAVOR_BACKENDS", None)
-    if isinstance(favor, dict):
-        favor["RDNA_ATTN"] = True
-        favor["TRITON_ATTN"] = False
-        favor["FLASH_ATTN"] = False
-        favor["FLASHINFER"] = False
-    # Also pre-import the kernel module so the first forward doesn't
-    # pay the load_inline cost (mirrors what rocm_attn does at import
-    # time on the first call).
+if is_available():
     try:
         _get_fa_rdna2_module()
     except Exception as exc:
         logger.debug("RDNA_ATTN pre-warm skipped: %s", exc)
-
-
-# Trigger the registration when the module is imported. This side
-# effect matches how vllm.v1.attention.backends.{flash_attn,triton_attn,
-# rocm_attn} each register themselves at import time.
-_register_with_selector()
