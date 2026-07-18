@@ -27,7 +27,7 @@ FROM ${BASE_IMAGE} AS base
 ENV PATH=/opt/rocm/llvm/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV ROCM_PATH=/opt/rocm
 ENV LD_LIBRARY_PATH=/opt/rocm/lib:/usr/local/lib:
-ARG PYTORCH_ROCM_ARCH=gfx90a;gfx942;gfx950;gfx1100;gfx1101;gfx1200;gfx1201;gfx1150;gfx1151
+ARG PYTORCH_ROCM_ARCH=gfx90a;gfx942;gfx950;gfx1030;gfx1100;gfx1101;gfx1200;gfx1201;gfx1150;gfx1151
 ENV PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH}
 ENV AITER_ROCM_ARCH=gfx942;gfx950
 ENV MORI_GPU_ARCHS=gfx942;gfx950
@@ -254,7 +254,7 @@ RUN mkdir -p /app/install && cp /app/aiter/dist/*.whl /app/install
 ### Final Build
 ###
 
-# Wheel release stage - 
+# Wheel release stage -
 # only includes dependencies used by wheel release pipeline
 FROM base AS debs_wheel_release
 RUN mkdir /app/debs

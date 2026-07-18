@@ -478,6 +478,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
         self._prefill_kernels_warmed_up = False
+        self._decode_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
         )
@@ -1114,6 +1115,108 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         torch.accelerator.empty_cache()
 
+    def _warmup_decode_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
+        """Warm up GDN decode kernels during V1 profiling (Phase 16 RDNA3 fix).
+
+        The MTP drafter's decode step triggers JIT compilation of
+        fused_sigmoid_gating_delta_rule_update, fused_recurrent_gated_delta_rule_packed_decode,
+        and _causal_conv1d_update_kernel on the first real inference request
+        (after the warmup probe runs with attn_metadata=None). With MTP=2, the
+        drafter processes sequences of T=1 (single decode) and T=3 (1 sampled
+        + 2 draft). The JIT-compiled kernels crash with hipErrorIllegalAddress
+        when processing degenerate SSM state from the first request.
+
+        Cover both shapes (T=1 and T=3) here so the kernels JIT-compile during
+        warmup (when GPU memory is plentiful) instead of mid-inference.
+        """
+        if self._decode_kernels_warmed_up:
+            return
+        self._decode_kernels_warmed_up = True
+
+        device = qkv_or_qkvz.device
+        dtype = qkv_or_qkvz.dtype
+        num_k_heads = self.num_k_heads // self.tp_size
+        num_v_heads = self.num_v_heads // self.tp_size
+        _, state_dtype = self.get_state_dtype()
+
+        # Cover the shapes the MTP drafter hits: T=1 (single decode) and T=3
+        # (MTP=2 decode with 1 sampled + 2 draft). AITER fused reshape is not
+        # covered here because it has fixed kernel params (no autotuning).
+        for T in (1, 3):
+            try:
+                # Conv1d update warmup (T tokens, conv_width=4)
+                conv_state = torch.zeros(
+                    1, num_v_heads * self.head_v_dim, 4 - 1,
+                    device=device, dtype=state_dtype,
+                )
+                dummy_x = torch.randn(T, num_v_heads * self.head_v_dim, device=device, dtype=dtype)
+                causal_conv1d_update(
+                    dummy_x,
+                    conv_state,
+                    self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2)),
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=torch.tensor([0], device=device, dtype=torch.int32),
+                    validate_data=False,
+                )
+
+                # Packed decode warmup (T=1, single decode)
+                if T == 1:
+                    dummy_qkv = torch.randn(
+                        T, num_k_heads * self.head_k_dim * 2 + num_v_heads * self.head_v_dim,
+                        device=device, dtype=dtype,
+                    )
+                    dummy_a = torch.randn(T, num_v_heads, device=device, dtype=dtype)
+                    dummy_b = torch.randn(T, num_v_heads, device=device, dtype=dtype)
+                    ssm_state = torch.zeros(
+                        1, num_v_heads, self.head_v_dim, self.head_k_dim,
+                        device=device, dtype=state_dtype,
+                    )
+                    out = torch.empty(T, 1, num_v_heads, self.head_v_dim, device=device, dtype=dtype)
+                    fused_recurrent_gated_delta_rule_packed_decode(
+                        mixed_qkv=dummy_qkv, a=dummy_a, b=dummy_b,
+                        A_log=self.A_log, dt_bias=self.dt_bias,
+                        scale=self.head_k_dim**-0.5,
+                        initial_state=ssm_state, out=out,
+                        ssm_state_indices=torch.tensor([0], device=device, dtype=torch.int32),
+                        use_qk_l2norm_in_kernel=True,
+                    )
+
+                # Sigmoid gating update warmup (T tokens, cu_seqlens=[0, T])
+                dummy_q = torch.randn(1, T, num_k_heads, self.head_k_dim, device=device, dtype=dtype)
+                dummy_k = torch.randn(1, T, num_k_heads, self.head_k_dim, device=device, dtype=dtype)
+                dummy_v = torch.randn(1, T, num_v_heads, self.head_v_dim, device=device, dtype=dtype)
+                dummy_a_sg = torch.randn(1, T, num_v_heads, device=device, dtype=dtype)
+                dummy_b_sg = torch.randn(1, T, num_v_heads, device=device, dtype=dtype)
+                ssm_state_sg = torch.zeros(
+                    1, num_v_heads, self.head_v_dim, self.head_k_dim,
+                    device=device, dtype=state_dtype,
+                )
+                cu_seqlens = torch.tensor([0, T], device=device, dtype=torch.int32)
+                fused_sigmoid_gating_delta_rule_update(
+                    A_log=self.A_log, a=dummy_a_sg, b=dummy_b_sg,
+                    dt_bias=self.dt_bias, q=dummy_q, k=dummy_k, v=dummy_v,
+                    initial_state=ssm_state_sg, inplace_final_state=True,
+                    cu_seqlens=cu_seqlens,
+                    ssm_state_indices=torch.tensor([[0]], device=device, dtype=torch.int32),
+                    num_accepted_tokens=torch.tensor([T], device=device, dtype=torch.int32),
+                    use_qk_l2norm_in_kernel=True,
+                )
+            except Exception:
+                logger.warning(
+                    "GDN decode kernel warmup (T=%d) failed for layer %s. "
+                    "First inference may JIT-compile mid-decode, risking "
+                    "hipErrorIllegalAddress on degenerate SSM state.",
+                    T, self.prefix, exc_info=True,
+                )
+            else:
+                logger.debug(
+                    "GDN decode kernel warmup (T=%d) completed for layer %s",
+                    T, self.prefix,
+                )
+            finally:
+                torch.accelerator.empty_cache()
+
     def _forward_core_rocm(
         self,
         qkvz: torch.Tensor,
@@ -1141,6 +1244,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if attn_metadata_raw is None:
             v_dim = core_attn_out.shape[-1] * core_attn_out.shape[-2]
             self._warmup_prefill_kernels(qkvz, v_dim)
+            self._warmup_decode_kernels(qkvz, v_dim)
             return
 
         assert isinstance(attn_metadata_raw, dict)
@@ -1197,6 +1301,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         if attn_metadata_raw is None:
             self._warmup_prefill_kernels(mixed_qkv, 0)
+            self._warmup_decode_kernels(mixed_qkv, 0)
             return
 
         assert isinstance(attn_metadata_raw, dict)

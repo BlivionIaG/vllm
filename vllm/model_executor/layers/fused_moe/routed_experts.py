@@ -628,6 +628,7 @@ class RoutedExperts(PluggableLayer):
         if quant_method_name in (
             "CompressedTensorsWNA16MarlinMoEMethod",
             "CompressedTensorsWNA16MoEMethod",
+            "CompressedTensorsWNA16RDNA2MoEMethod",
             "CompressedTensorsWNA16RDNA3MoEMethod",
             "CompressedTensorsW4A16FlydslMoEMethod",
         ):

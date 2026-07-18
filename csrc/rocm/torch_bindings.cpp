@@ -47,6 +47,63 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "          Tensor scale_b, int CuCount) -> ()");
   rocm_ops.impl("wvSplitKQ", torch::kCUDA, &wvSplitKQ);
 
+#ifdef VLLM_ROCM_GFX1030
+  // W4A16 GPTQ kernel for AMD RDNA2 (gfx1030).
+  rocm_ops.def(
+      "gptq_gemm_rdna2(Tensor a, Tensor b_q_weight, Tensor b_qzeros, "
+      "Tensor b_scales, Tensor b_g_idx, bool use_v2_format) -> Tensor");
+  rocm_ops.impl("gptq_gemm_rdna2", torch::kCUDA, &gptq_gemm_rdna2);
+
+  rocm_ops.def(
+      "gptq_gemm_rdna2_prefill(Tensor a, Tensor b_q_weight, "
+      "Tensor b_qzeros, Tensor b_scales, Tensor b_g_idx, "
+      "bool use_v2_format) -> Tensor");
+  rocm_ops.impl("gptq_gemm_rdna2_prefill", torch::kCUDA,
+                &gptq_gemm_rdna2_prefill);
+
+  // FA-RDNA2: Flash-Attention v2 hand-port for AMD RDNA2 (gfx1030).
+  // Dispatched via a fast path in RocmAttentionImpl.forward().
+  rocm_ops.def(
+      "fa_rdna2_decode_paged(Tensor Q, Tensor key_cache, Tensor value_cache, "
+      "Tensor block_table, Tensor seq_lens, int block_size, int kv_splits, "
+      "int sliding_window) -> Tensor");
+  rocm_ops.impl("fa_rdna2_decode_paged", torch::kCUDA,
+                &fa_rdna2_decode_paged);
+
+  rocm_ops.def(
+      "fa_rdna2_prefill_paged_varlen(Tensor Q, Tensor key_cache, "
+      "Tensor value_cache, Tensor block_table, Tensor cu_query_lens, "
+      "Tensor seq_lens, int block_size, int causal, int sliding_window) "
+      "-> Tensor");
+  rocm_ops.impl("fa_rdna2_prefill_paged_varlen", torch::kCUDA,
+                &fa_rdna2_prefill_paged_varlen);
+
+  rocm_ops.def(
+      "fa_rdna2_prefill_paged_varlen_short(Tensor Q, Tensor key_cache, "
+      "Tensor value_cache, Tensor block_table, Tensor cu_query_lens, "
+      "Tensor seq_lens, int block_size, int causal, int sliding_window) "
+      "-> Tensor");
+  rocm_ops.impl("fa_rdna2_prefill_paged_varlen_short", torch::kCUDA,
+                &fa_rdna2_prefill_paged_varlen_short);
+
+  rocm_ops.def(
+      "fa_rdna2_prefill_paged_varlen_splitk(Tensor Q, Tensor key_cache, "
+      "Tensor value_cache, Tensor block_table, Tensor cu_query_lens, "
+      "Tensor seq_lens, int block_size, int causal, int kv_splits, "
+      "int sliding_window) -> Tensor");
+  rocm_ops.impl("fa_rdna2_prefill_paged_varlen_splitk", torch::kCUDA,
+                &fa_rdna2_prefill_paged_varlen_splitk);
+
+  rocm_ops.def(
+      "moe_gptq_gemm_rdna2(Tensor a, Tensor(a!) c, Tensor b_q_weight, "
+      "Tensor(a) b_scales, Tensor b_qzeros, Tensor(a) topk_weights, "
+      "Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, "
+      "int top_k, int block_size_m, bool mul_topk_weight, "
+      "int output_topk) -> ()");
+  rocm_ops.impl("moe_gptq_gemm_rdna2", torch::kCUDA, &moe_gptq_gemm_rdna2);
+#endif
+
 #ifdef VLLM_ROCM_GFX1100
   // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
   rocm_ops.def(

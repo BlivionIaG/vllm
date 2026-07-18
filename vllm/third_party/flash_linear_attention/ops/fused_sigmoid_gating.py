@@ -40,6 +40,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     scale,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
+    num_blocks_g: tl.int64,  # bounds-check guard for SSM state indices (RDNA3 fix)
     B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
@@ -106,12 +107,14 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
                 i_t = tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1
             else:
                 i_t = 0
-            # Load state index and check for invalid entries
+            # Load state index and check for invalid entries.
+            # NULL_BLOCK_ID=0 collides with the real block-0 cache slot,
+            # so the original `state_idx <= 0` check silently skipped
+            # sequences whose state actually lived in block 0.
             state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
                 tl.int64
             )
-            # Skip if state index is invalid (NULL_BLOCK_ID=0)
-            if state_idx <= 0:
+            if state_idx < 0 or state_idx >= num_blocks_g:
                 return
             p_h0 = h0 + state_idx * stride_init_state_token
         else:
@@ -155,12 +158,13 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # keep the states for multi-query tokens
         if INPLACE_FINAL_STATE:
-            # Load state index and check for invalid entries
+            # Load state index and check for invalid entries.
+            # The original `final_state_idx > 0` check skipped writes back
+            # to the real block-0 cache slot (NULL_BLOCK_ID=0 collides).
             final_state_idx = tl.load(
                 ssm_state_indices + i_n * stride_indices_seq + i_t
             ).to(tl.int64)
-            # Only store if state index is valid (not NULL_BLOCK_ID=0)
-            if final_state_idx > 0:
+            if final_state_idx >= 0 and final_state_idx < num_blocks_g:
                 p_ht = ht + final_state_idx * stride_final_state_token
                 p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
                 tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
@@ -258,6 +262,7 @@ def fused_sigmoid_gating_delta_rule_update(
         scale=scale,
         N=N,
         T=T,
+        num_blocks_g=initial_state.shape[0],
         B=B,
         H=H,
         HV=HV,
