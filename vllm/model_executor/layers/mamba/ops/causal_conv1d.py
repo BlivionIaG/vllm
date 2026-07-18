@@ -935,15 +935,31 @@ def _causal_conv1d_update_kernel(
     conv_states_offset = tl.load(
         conv_state_indices_ptr + idx_seq * stride_state_indices + current_last_index
     ).to(tl.int64)
-    conv_state_ptrs_target = (
-        conv_state_ptr
-        + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
-        + (idx_feats * stride_conv_state_dim)
-    )[None, :] + (  # [BLOCK_N,]
-        idx_tokens * stride_conv_state_tok
-    )[:, None]
-    mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
-    tl.store(conv_state_ptrs_target, new_conv_state, mask)
+    # Bounds check: guard the write-back path the same way the read path is
+    # guarded at the top of this kernel. Without this guard, an out-of-range
+    # conv_states_offset (e.g. NULL_BLOCK_ID=0 collision on real block 0, or
+    # a stale/drafter-path index) silently writes new_conv_state to an
+    # arbitrary memory location, corrupting the conv state cache. The next
+    # forward pass then loads garbage from the corrupted slot and feeds it
+    # into the downstream GDN/SSM kernels, producing NaN logits. This was
+    # observed on par1-cs13 (RDNA3 / gfx1100) with MTP=2 and VLLM_USE_V2
+    # _MODEL_RUNNER=1 after the GDN bounds-check fix landed.
+    if conv_states_offset < 0 or conv_states_offset >= num_cache_lines:
+        # Skip the write-back but continue to compute the output; the rest
+        # of the kernel computes the new conv output from x and conv_state
+        # in registers, so a missed cache write does not corrupt the output
+        # produced for this step.
+        pass
+    else:
+        conv_state_ptrs_target = (
+            conv_state_ptr
+            + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
+            + (idx_feats * stride_conv_state_dim)
+        )[None, :] + (  # [BLOCK_N,]
+            idx_tokens * stride_conv_state_tok
+        )[:, None]
+        mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+        tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator
     if HAS_BIAS:
