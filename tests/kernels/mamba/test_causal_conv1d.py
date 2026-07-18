@@ -234,7 +234,7 @@ def test_causal_conv1d_update_with_batch_gather(
         [
             conv_state_indices,
             torch.as_tensor(
-                [NULL_BLOCK_ID] * padding, dtype=torch.int32, device=device
+                [total_entries] * padding, dtype=torch.int32, device=device
             ),
         ],
         dim=0,
@@ -339,7 +339,7 @@ def test_causal_conv1d_varlen(
         [
             state_indices,
             torch.as_tensor(
-                [NULL_BLOCK_ID] * padding, dtype=torch.int32, device=device
+                [total_entries] * padding, dtype=torch.int32, device=device
             ),
         ],
         dim=-1,
@@ -361,7 +361,7 @@ def test_causal_conv1d_varlen(
     splits = [torch.split(var, seqlens[0], dim=-1) for var in (x_ref)]
     for i in range(len(seqlens[0])):
         x_s = [v[i].unsqueeze(0) for v in splits][0]
-        if padded_state_indices[i] == NULL_BLOCK_ID:
+        if padded_state_indices[i] == total_entries:
             continue
         out_ref_b.append(
             causal_conv1d_ref(
