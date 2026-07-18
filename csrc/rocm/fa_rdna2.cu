@@ -319,8 +319,8 @@ __global__ __launch_bounds__(128, 1) void fa_decode_paged_splitk_kernel(
       // Each thread t owns output dim t.
       float pv = 0.0f;
       if (t < HEAD_DIM_PAGED_128) {
-        for (int k = 0; k < BC; k++) {
-          // sV layout: [BC][HEAD_DIM]; thread t accumulates V[k][t].
+        for (int k = 0; k < blk_size; k++) {
+          // sV layout: [blk_size][HEAD_DIM]; thread t accumulates V[k][t].
           pv += sP[k] * __half2float(sV[k * HEAD_DIM_PAGED_128 + t]);
         }
       }
@@ -477,7 +477,7 @@ __global__ __launch_bounds__(256, 1) void fa_decode_paged_splitk_kernel_256(
 
       if (t < 256) {
         float pv = 0.0f;
-        for (int k = 0; k < BC_256; k++) {
+        for (int k = 0; k < blk_size; k++) {
           pv += sP[k] * __half2float(sV[k * 256 + t]);
         }
         o_acc = exp_diff * o_acc + pv;
