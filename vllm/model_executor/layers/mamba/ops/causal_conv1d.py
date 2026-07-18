@@ -133,14 +133,12 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         conv_state_indices_ptr + idx_seq * stride_cache_indices + conv_state_init_index
     ).to(tl.int64)
 
-    if HAS_NULL_BLOCK:  # noqa
-        if conv_states_input_coord == null_block_id:
-            # not processing as this is a null block (padding)
-            return
-    # Bounds check: if cache_indices points outside the conv_states buffer,
-    # bail out before computing pointers. Without this guard, stale/wrong
-    # state_indices_tensor entries from the drafter path produce
-    # hipErrorIllegalAddress in causal_conv1d on RDNA3 (par1-cs13).
+    # Skip if conv_states_input_coord is outside the actual conv_states buffer.
+    # No NULL_BLOCK_ID short-circuit here: NULL_BLOCK_ID=0 (utils.py) collides
+    # with the real block-0 cache slot, and the Qwen3-Next GDN path always
+    # sources conv_state_indices from block_table[:, 0] — a real block index
+    # for any allocated sequence. Silently returning on coord==0 would skip
+    # block-0 reads and cause downstream GDN/SSM kernels to load stale state.
     if conv_states_input_coord < 0 or conv_states_input_coord >= num_cache_lines:
         return
     conv_states_base = (
@@ -820,12 +818,12 @@ def _causal_conv1d_update_kernel(
         conv_state_indices_ptr + idx_seq * stride_state_indices + conv_state_init
     ).to(tl.int64)
 
-    if HAS_NULL_BLOCK:  # noqa
-        if conv_states_input_coord == null_block_id:
-            # not processing as this is not the actual sequence
-            return
-    # Bounds check against the actual conv_states buffer (par1-cs13
-    # / RDNA3 fix). See the matching guard in _causal_conv1d_fwd_kernel.
+    # Skip if conv_states_input_coord is outside the actual conv_states buffer.
+    # No NULL_BLOCK_ID short-circuit here: NULL_BLOCK_ID=0 (utils.py) collides
+    # with the real block-0 cache slot, and the Qwen3-Next GDN decode path
+    # always passes a real block index here (see _causal_conv1d_fwd_kernel for
+    # the matching guard). Silently returning on coord==0 would skip block-0
+    # reads and feed stale state to the downstream GDN/SSM kernels.
     if conv_states_input_coord < 0 or conv_states_input_coord >= num_cache_lines:
         return
 
