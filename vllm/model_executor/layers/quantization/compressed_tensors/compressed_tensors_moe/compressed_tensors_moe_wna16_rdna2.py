@@ -161,8 +161,10 @@ def _rdna2_fused_moe(
 ) -> torch.Tensor:
     """Fused MoE forward using the RDNA2 W4A16 HIP kernel.
 
+    fp16 only — bf16 is not supported on gfx1030 (no v_dot2_f32_bf16 intrinsic).
+
     Optimizations vs naive dispatch:
-      - BLOCK_SIZE_M=1 for decode (no padding waste, bf16 fast path)
+      - BLOCK_SIZE_M=1 for decode (no padding waste)
       - Pre-allocated buffers (no torch.zeros per call)
       - Inline token sorting for small M (skip moe_align_block_size)
       - moe_sum fused into output accumulation

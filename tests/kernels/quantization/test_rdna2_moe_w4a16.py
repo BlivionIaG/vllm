@@ -7,6 +7,11 @@ Tests ``moe_gptq_gemm_rdna2`` against the dense ``gptq_gemm_rdna2`` as
 reference: builds RDNA2-format weights (shuffled int32, synthesized qzeros),
 runs the fused MoE kernel, and compares per-expert results.
 
+bf16 is not supported on gfx1030 (lacks v_dot2_f32_bf16 intrinsic — RDNA3+
+feature). bf16 parametrize variants are explicitly skipped. RDNA3+ support
+for bf16 lives in the upstream ``compressed_tensors_moe_wna16_rdna3.py``
+path; this file is RDNA2-only.
+
 Model parameters taken from:
   - cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
     (hidden=2048, inter=768, E=128, top_k=8, G=32)
@@ -102,13 +107,16 @@ def _make_qzeros(E, groups, N):
 @pytest.mark.parametrize(
     "dtype",
     [
-        torch.float16,
+        pytest.param(
+            torch.float16,
+            id="fp16",
+        ),
         pytest.param(
             torch.bfloat16,
-            marks=pytest.mark.xfail(
-                reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); bf16 path uses fp16 dot "
-                "fallback not yet wired into dispatch",
-                
+            id="bf16",
+            marks=pytest.mark.skip(
+                reason="bf16 not supported on gfx1030: lacks v_dot2_f32_bf16 "
+                "intrinsic (RDNA3+ feature). Use fp16.",
             ),
         ),
     ],
@@ -165,9 +173,10 @@ def test_fused_moe_w1_matches_dense(
             )
             ref_out[flat] = ref.squeeze()
 
-    # Split-K atomics can cause minor fp16/bf16 rounding differences
-    # at large K (e.g. K=2048 → 8 K-blocks). Use allclose, not equal.
-    atol = 0.5 if dtype == torch.bfloat16 else 0.1
+    # Split-K atomics can cause minor fp16 rounding differences at large
+    # K (e.g. K=2048 → 8 K-blocks). Use allclose, not equal.
+    # bf16 path is not supported on gfx1030 (no v_dot2_f32_bf16).
+    atol = 0.1
     assert torch.allclose(fused_out, ref_out, atol=atol, rtol=0.01), (
         f"max diff: {(fused_out - ref_out).abs().max().item()}"
     )
@@ -179,13 +188,16 @@ def test_fused_moe_w1_matches_dense(
 @pytest.mark.parametrize(
     "dtype",
     [
-        torch.float16,
+        pytest.param(
+            torch.float16,
+            id="fp16",
+        ),
         pytest.param(
             torch.bfloat16,
-            marks=pytest.mark.xfail(
-                reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); bf16 path uses fp16 dot "
-                "fallback not yet wired into dispatch",
-                
+            id="bf16",
+            marks=pytest.mark.skip(
+                reason="bf16 not supported on gfx1030: lacks v_dot2_f32_bf16 "
+                "intrinsic (RDNA3+ feature). Use fp16.",
             ),
         ),
     ],
@@ -246,7 +258,7 @@ def test_fused_moe_output_topk_reduces(E, K, N_inter, top_k, group_size, M, dtyp
         top_k,
     )
 
-    atol = 1.0 if dtype == torch.bfloat16 else 0.1
+    atol = 0.1
     assert torch.allclose(fused, ref, atol=atol, rtol=0.01), (
         f"max diff: {(fused - ref).abs().max().item()}"
     )
@@ -258,13 +270,16 @@ def test_fused_moe_output_topk_reduces(E, K, N_inter, top_k, group_size, M, dtyp
 @pytest.mark.parametrize(
     "dtype",
     [
-        torch.float16,
+        pytest.param(
+            torch.float16,
+            id="fp16",
+        ),
         pytest.param(
             torch.bfloat16,
-            marks=pytest.mark.xfail(
-                reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); bf16 path uses fp16 dot "
-                "fallback not yet wired into dispatch",
-                
+            id="bf16",
+            marks=pytest.mark.skip(
+                reason="bf16 not supported on gfx1030: lacks v_dot2_f32_bf16 "
+                "intrinsic (RDNA3+ feature). Use fp16.",
             ),
         ),
     ],
@@ -368,29 +383,27 @@ def test_full_moe_e2e(E, K, N_inter, top_k, group_size, M, dtype):
 
 
 @gfx1030_only
-@pytest.mark.xfail(
-    reason="gfx1030 lacks v_dot2_f32_bf16 (RDNA3+); bf16 path uses fp16 dot fallback "
-    "not yet wired into dispatch. Test hardcodes bfloat16; sentinel-expert test "
-    "should be re-added when bf16 kernel lands.",
-    
-)
 def test_expert_id_minus_one():
-    """Kernel handles expert_id == -1 (expert parallelism) without crash."""
+    """Kernel handles expert_id == -1 (expert parallelism) without crash.
+
+    RDNA2 (gfx1030) only supports fp16; bf16 path is intentionally not
+    implemented because gfx1030 lacks v_dot2_f32_bf16. See AGENTS.md.
+    """
     # Qwen3-30B-A3B dims (E capped for memory)
     E, K, N = 16, 2048, 768
     groups = K // 32
 
     w = _make_packed_weights(E, K, N)
-    ws = _make_scales(E, groups, N, torch.bfloat16)
+    ws = _make_scales(E, groups, N, torch.float16)
     wz = _make_qzeros(E, groups, N)
-    x = torch.randn(1, K, dtype=torch.bfloat16, device=device)
+    x = torch.randn(1, K, dtype=torch.float16, device=device)
 
     # Manually create sorted_token_ids/expert_ids with -1
     sorted_ids = torch.tensor([0], dtype=torch.int32, device=device)
     expert_ids = torch.tensor([-1], dtype=torch.int32, device=device)
     ntp = torch.tensor([1], dtype=torch.int32, device=device)
 
-    out = torch.zeros(1, N, dtype=torch.bfloat16, device=device)
+    out = torch.zeros(1, N, dtype=torch.float16, device=device)
     ops.moe_gptq_gemm_rdna2(
         x,
         out,
