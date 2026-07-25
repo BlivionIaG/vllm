@@ -373,8 +373,10 @@ def use_rocm_custom_paged_attention(
         )
 
     else:
+        if os.environ.get("VLLM_USE_RDNA2_FA") != "1":
+            return False
         return (
-            _ON_GFX1X
+            (_ON_GFX10X or _ON_GFX1X)
             and (sliding_window == 0 or sliding_window == (-1, -1))
             and (qtype == torch.half or qtype == torch.bfloat16)
             and head_size == 128
