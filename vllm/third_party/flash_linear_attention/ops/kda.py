@@ -84,6 +84,7 @@ def fused_recurrent_kda_fwd(
         scale=scale,
         N=N,
         T=T,
+        num_blocks_g=initial_state.shape[0],
         B=B,
         H=H,
         HV=HV,

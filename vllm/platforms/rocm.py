@@ -209,6 +209,7 @@ def _get_gcn_arch() -> str:
 _GCN_ARCH = _get_gcn_arch()
 
 _ON_GFX1X = any(arch in _GCN_ARCH for arch in ["gfx11", "gfx12"])
+_ON_GFX10X = any(arch in _GCN_ARCH for arch in ["gfx10"])
 _ON_GFX11 = "gfx11" in _GCN_ARCH
 _ON_GFX1100 = "gfx1100" in _GCN_ARCH
 _ON_GFX1151 = "gfx1151" in _GCN_ARCH
@@ -295,6 +296,10 @@ def on_gfx1x() -> bool:
     return _ON_GFX1X
 
 
+def on_gfx10x() -> bool:
+    return _ON_GFX10X
+
+
 def on_gfx11() -> bool:
     return _ON_GFX11
 
@@ -368,8 +373,10 @@ def use_rocm_custom_paged_attention(
         )
 
     else:
+        if os.environ.get("VLLM_USE_RDNA2_FA") != "1":
+            return False
         return (
-            _ON_GFX1X
+            (_ON_GFX10X or _ON_GFX1X)
             and (sliding_window == 0 or sliding_window == (-1, -1))
             and (qtype == torch.half or qtype == torch.bfloat16)
             and head_size == 128

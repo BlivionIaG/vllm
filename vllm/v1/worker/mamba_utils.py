@@ -32,6 +32,7 @@ def _copy_mamba_state_block(
     token_bias,
     block_table_ptrs_ptr,
     block_table_stride_req,
+    num_blocks_g,  # max blocks per req in block table (RDNA3 bounds-check guard)
     state_base_addrs_ptr,
     state_block_strides_ptr,
     state_elem_sizes_ptr,
@@ -71,6 +72,15 @@ def _copy_mamba_state_block(
     group_base_addr = tl.load(block_table_ptrs_ptr + group_idx)
     block_table_typed = group_base_addr.to(tl.pointer_type(tl.int32))
     block_table_base = block_table_typed + bt_row_idx * block_table_stride_req
+
+    # RDNA3 fix: guard block table reads against out-of-bounds columns. Defense
+    # in depth — callers should validate src_col/dst_col first, but this
+    # prevents the copy from reading garbage block IDs if a stale or corrupt
+    # state_idx reaches this code path.
+    if src_col < 0 or src_col >= num_blocks_g:
+        return
+    if dst_col < 0 or dst_col >= num_blocks_g:
+        return
 
     # Widen block ids to int64 before they reach `block_id * state_block_stride`
     # below: state_block_stride can exceed 2**31 bytes for large mamba caches,
@@ -267,6 +277,7 @@ def postprocess_mamba_fused_kernel(
         accept_token_bias,
         block_table_ptrs_ptr,
         block_table_stride_req,
+        block_table_stride_req,
         state_base_addrs_ptr,
         state_block_strides_ptr,
         state_elem_sizes_ptr,
@@ -336,6 +347,7 @@ def precopy_mamba_align_fused_kernel(
     # Same flattened state-layout metadata as postprocess_mamba_fused_kernel
     block_table_ptrs_ptr,
     block_table_stride_req: tl.int64,
+    num_blocks_g: tl.int64,  # max blocks per req in block table (RDNA3 bounds-check guard)
     state_base_addrs_ptr,
     state_block_strides_ptr,
     state_elem_sizes_ptr,
@@ -372,10 +384,19 @@ def precopy_mamba_align_fused_kernel(
 
     src_col = tl.load(src_col_ptr + req_idx)
     dst_col = tl.load(mamba_state_idx_ptr + req_idx)
+    # RDNA3 fix: guard against out-of-bounds block table reads. The pre-advance
+    # state_idx can be any valid block column; if it's >= num_blocks_g, the
+    # block_table_base + src_col load below reads garbage and corrupts SSM
+    # state. Also guard dst_col for symmetry (the post-advance state_idx should
+    # always be valid, but a bounds check costs nothing).
+    if src_col < 0 or src_col >= num_blocks_g:
+        return
+    if dst_col < 0 or dst_col >= num_blocks_g:
+        return
     # Fresh state, or still writing the same block: kernels locate the initial
     # state in-block via num_accepted (preserved when no boundary is crossed),
     # so there is nothing to copy.
-    if src_col < 0 or src_col == dst_col:
+    if src_col == dst_col:
         return
 
     token_bias = tl.load(token_bias_ptr + req_idx)
@@ -387,6 +408,7 @@ def precopy_mamba_align_fused_kernel(
         token_bias,
         block_table_ptrs_ptr,
         block_table_stride_req,
+        num_blocks_g,
         state_base_addrs_ptr,
         state_block_strides_ptr,
         state_elem_sizes_ptr,
@@ -818,6 +840,7 @@ class MambaSpecDecodeGPUContext:
             src_col_gpu,
             token_bias_gpu,
             self.block_table_ptrs,
+            self.block_table_stride_req,
             self.block_table_stride_req,
             self.state_base_addrs,
             self.state_block_strides,

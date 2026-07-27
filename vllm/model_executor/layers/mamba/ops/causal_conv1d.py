@@ -128,20 +128,27 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         x_ptr + sequence_start_index * stride_x_token + idx_feats * stride_x_dim
     )  # [BLOCK_N,]
 
-    # cache_idx
+        # cache_idx
     conv_states_input_coord = tl.load(
         conv_state_indices_ptr + idx_seq * stride_cache_indices + conv_state_init_index
     ).to(tl.int64)
 
-    if HAS_NULL_BLOCK:  # noqa
-        if conv_states_input_coord == null_block_id:
-            # not processing as this is a null block (padding)
-            return
+    # Skip if conv_states_input_coord is outside the actual conv_states buffer.
+    # No NULL_BLOCK_ID short-circuit here: NULL_BLOCK_ID=0 (utils.py) collides
+    # with the real block-0 cache slot, and the Qwen3-Next GDN path always
+    # sources conv_state_indices from block_table[:, 0] — a real block index
+    # for any allocated sequence. Silently returning on coord==0 would skip
+    # block-0 reads and cause downstream GDN/SSM kernels to load stale state.
+    if conv_states_input_coord < 0 or conv_states_input_coord >= num_cache_lines:
+        return
     conv_states_base = (
         conv_states_ptr
         + (conv_states_input_coord * stride_conv_state_seq)
         + (idx_feats * stride_conv_state_dim)
     )  # [BLOCK_N,]
+
+
+
 
     w_base = w_ptr + (idx_feats * stride_w_dim)  # [BLOCK_N,]
 
@@ -811,10 +818,14 @@ def _causal_conv1d_update_kernel(
         conv_state_indices_ptr + idx_seq * stride_state_indices + conv_state_init
     ).to(tl.int64)
 
-    if HAS_NULL_BLOCK:  # noqa
-        if conv_states_input_coord == null_block_id:
-            # not processing as this is not the actual sequence
-            return
+    # Skip if conv_states_input_coord is outside the actual conv_states buffer.
+    # No NULL_BLOCK_ID short-circuit here: NULL_BLOCK_ID=0 (utils.py) collides
+    # with the real block-0 cache slot, and the Qwen3-Next GDN decode path
+    # always passes a real block index here (see _causal_conv1d_fwd_kernel for
+    # the matching guard). Silently returning on coord==0 would skip block-0
+    # reads and feed stale state to the downstream GDN/SSM kernels.
+    if conv_states_input_coord < 0 or conv_states_input_coord >= num_cache_lines:
+        return
 
     if IS_VARLEN:
         query_start_index = tl.load(query_start_loc_ptr + idx_seq).to(tl.int64)
@@ -922,15 +933,31 @@ def _causal_conv1d_update_kernel(
     conv_states_offset = tl.load(
         conv_state_indices_ptr + idx_seq * stride_state_indices + current_last_index
     ).to(tl.int64)
-    conv_state_ptrs_target = (
-        conv_state_ptr
-        + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
-        + (idx_feats * stride_conv_state_dim)
-    )[None, :] + (  # [BLOCK_N,]
-        idx_tokens * stride_conv_state_tok
-    )[:, None]
-    mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
-    tl.store(conv_state_ptrs_target, new_conv_state, mask)
+    # Bounds check: guard the write-back path the same way the read path is
+    # guarded at the top of this kernel. Without this guard, an out-of-range
+    # conv_states_offset (e.g. NULL_BLOCK_ID=0 collision on real block 0, or
+    # a stale/drafter-path index) silently writes new_conv_state to an
+    # arbitrary memory location, corrupting the conv state cache. The next
+    # forward pass then loads garbage from the corrupted slot and feeds it
+    # into the downstream GDN/SSM kernels, producing NaN logits. This was
+    # observed on par1-cs13 (RDNA3 / gfx1100) with MTP=2 and VLLM_USE_V2
+    # _MODEL_RUNNER=1 after the GDN bounds-check fix landed.
+    if conv_states_offset < 0 or conv_states_offset >= num_cache_lines:
+        # Skip the write-back but continue to compute the output; the rest
+        # of the kernel computes the new conv output from x and conv_state
+        # in registers, so a missed cache write does not corrupt the output
+        # produced for this step.
+        pass
+    else:
+        conv_state_ptrs_target = (
+            conv_state_ptr
+            + (conv_states_offset * stride_conv_state_seq)  # Offset from seq
+            + (idx_feats * stride_conv_state_dim)
+        )[None, :] + (  # [BLOCK_N,]
+            idx_tokens * stride_conv_state_tok
+        )[:, None]
+        mask = (idx_tokens < state_len)[:, None] & (idx_feats < dim)[None, :]
+        tl.store(conv_state_ptrs_target, new_conv_state, mask)
 
     # STEP 3: init accumulator
     if HAS_BIAS:
