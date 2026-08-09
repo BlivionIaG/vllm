@@ -162,6 +162,12 @@ from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
     CutlassFP8ScaledMMLinearKernel,
     CutlassInt8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.rdna2_w8a16_fp8 import (
+    RDNA2W8A16FP8LinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.rdna2_w8a16_fp8_block import (
+    RDNA2W8A16Fp8BlockLinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import (
     DeepGemmFp8BlockScaledMMKernel,
 )
@@ -368,6 +374,7 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
     ],
     PlatformEnum.ROCM: [
         AiterFp8BlockScaledMMKernel,
+        RDNA2W8A16Fp8BlockLinearKernel,
         TritonFp8BlockScaledMMKernel,
     ],
     PlatformEnum.CPU: [
@@ -385,7 +392,7 @@ _POSSIBLE_WFP8A16_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]
         MarlinFP8ScaledMMLinearKernel,
     ],
     PlatformEnum.ROCM: [
-        # To be added
+        RDNA2W8A16FP8LinearKernel,
     ],
     PlatformEnum.CPU: [
         # To be added

@@ -217,22 +217,30 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
         n = c.partition_weight_shape[1]
         kernel_name = _rdna2_w4a16_select_kernel(m, k, n)
 
-        if (kernel_name == "prefill"
-                and hasattr(ops, "gptq_gemm_rdna2_prefill")):
+        if kernel_name == "prefill" and hasattr(ops, "gptq_gemm_rdna2_prefill"):
             output = ops.gptq_gemm_rdna2_prefill(
                 x_2d, w_q, w_zp, w_s, w_g_idx, False)
-        elif (kernel_name == "exllama"
-                and hasattr(ops, "gptq_gemm")):
+        elif kernel_name == "exllama" and hasattr(ops, "gptq_gemm"):
             output = ops.gptq_gemm(
                 x_2d, w_q, w_zp, w_s, w_g_idx, True, False,
                 c.weight_type.size_bits)
-        elif hasattr(ops, "gptq_gemm_rdna2"):
+        elif kernel_name == "rdna2_decode" and hasattr(
+                ops, "gptq_gemm_rdna2"):
             output = ops.gptq_gemm_rdna2(
                 x_2d, w_q, w_zp, w_s, w_g_idx, False)
         else:
-            output = ops.gptq_gemm(
-                x_2d, w_q, w_zp, w_s, w_g_idx, True, False,
-                c.weight_type.size_bits)
+            if hasattr(ops, "gptq_gemm"):
+                output = ops.gptq_gemm(
+                    x_2d, w_q, w_zp, w_s, w_g_idx, True, False,
+                    c.weight_type.size_bits)
+            elif hasattr(ops, "gptq_gemm_rdna2"):
+                output = ops.gptq_gemm_rdna2(
+                    x_2d, w_q, w_zp, w_s, w_g_idx, False)
+            else:
+                raise RuntimeError(
+                    f"RDNA2 W4A16 dispatcher: kernel_name={kernel_name!r} but "
+                    "neither gptq_gemm nor gptq_gemm_rdna2 ops are "
+                    "available; rebuild the C++ extension")
 
         if bias is not None:
             output.add_(bias)
