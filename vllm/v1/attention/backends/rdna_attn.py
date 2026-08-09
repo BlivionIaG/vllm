@@ -260,6 +260,11 @@ class RdnaAttentionImpl(AttentionImpl):
             return False
         if is_quantized_kv_cache(self.kv_cache_dtype):
             return False
+        num_q_heads = query.shape[1] if query.dim() >= 2 else 0
+        num_kv_heads = key_cache.shape[1] if key_cache.dim() >= 2 else 0
+        if num_q_heads > 0 and num_kv_heads > 0 and \
+                num_q_heads % num_kv_heads != 0:
+            return False
         return True
 
     def _maybe_reinterp_v_to_5d(

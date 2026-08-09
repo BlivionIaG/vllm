@@ -103,7 +103,9 @@ def is_available() -> bool:
         return False
     if not torch.cuda.is_available():
         return False
-    # Check for gfx1030
+    # Cover gfx1030 family (gfx1030/1031/1032/1035). The kernel itself is
+    # compiled for gfx1030 only via load_inline; the family match is
+    # intentional since other gfx103x variants share the same ISA.
     try:
         props = torch.cuda.get_device_properties(0)
         if "gfx103" not in props.gcnArchName:
