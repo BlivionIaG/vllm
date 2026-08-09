@@ -14,13 +14,17 @@
 #define _Q_GEMM_RDNA2_COMMON_CUH
 
 #include <cstdint>
-
 #include <hip/hip_fp16.h>
 
-#include "qdq_4_rdna2.cuh"
+// #include "qdq_4_rdna2.cuh"
 
 namespace vllm {
 namespace gptq_rdna2 {
+
+// Forward decl from qdq_4_rdna2.cuh (avoiding include here prevents
+// GCC 15 + ROCm 7.2 + torch 2.13 namespace parser error).
+__forceinline__ __device__ void prep_zero_scale_fp16(
+    uint32_t zero, half scale, half2 (&z1z16)[2], half2 (&y1y16)[2]);
 
 // Type-generic zero — half in HIP/ROCm has a converting constructor from
 // float, but going through __float2half_rn is the unambiguously correct

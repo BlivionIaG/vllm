@@ -282,6 +282,8 @@ torch::Tensor gptq_gemm_rdna2(torch::Tensor a, torch::Tensor b_q_weight,
 
   TORCH_CHECK(b_q_weight.size(0) * 8 == size_k,
               "b_q_weight first dim must be K/8");
+  TORCH_CHECK(size_n % 8 == 0,
+              "N must be a multiple of 8 (qgemm/4bit nibble packing)");
   TORCH_CHECK(b_scales.size(0) == groups,
               "b_scales must have same group count as qzeros");
   TORCH_CHECK(b_scales.size(1) == size_n, "b_scales last dim must be N");

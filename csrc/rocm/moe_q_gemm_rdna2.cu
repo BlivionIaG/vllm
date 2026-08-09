@@ -359,9 +359,17 @@ void moe_gptq_gemm_rdna2(torch::Tensor a, torch::Tensor c,
 
   int expert_weight_stride = (int)(b_q_weight.size(1) * b_q_weight.size(2));
   int expert_scales_stride = (int)(b_scales.size(1) * b_scales.size(2));
-  int expert_zeros_stride = (int)(b_qzeros.size(1) * b_qzeros.size(2));
+  // Use tensor stride(0) instead of size(1)*size(2) so stride-0 broadcasted
+  // expand views (shared qzeros across all experts) work correctly.
+  // For materialized contiguous tensors, stride(0) == size(1)*size(2) and
+  // behavior is identical to the previous implementation.
+  int expert_zeros_stride = (int)b_qzeros.stride(0);
 
   int num_token_blocks = (int)(sorted_token_ids.size(0) / block_size_m);
+
+  TORCH_CHECK(topk_weights.numel() == 0 ||
+              topk_weights.scalar_type() == torch::kFloat32,
+              "topk_weights must be fp32 or empty");
 
   const float* topk_w_ptr =
       (topk_weights.numel() > 0) ? topk_weights.data_ptr<float>() : nullptr;
@@ -377,12 +385,8 @@ void moe_gptq_gemm_rdna2(torch::Tensor a, torch::Tensor c,
         size_n, size_k, groups, (int)top_k, (int)block_size_m,
         expert_weight_stride, expert_scales_stride, expert_zeros_stride,
         mul_topk_weight, (int)output_topk, stream);
-  } else if (a.scalar_type() == torch::kBFloat16) {
-    // gfx1030 has no v_dot2_f32_bf16 (RDNA3+); fallback to fp16 dot accumulator
-    // via __nv_bfloat16 -> half promotion. Path not used by production
-    // (gfx1030 serves only fp16 weights); kept as compile-only fallback so
-    // the op does not silently segfault on rare bf16 inputs.
-    TORCH_CHECK(false, "bfloat16 path is not yet implemented for gfx1030; "
-                "the W4A16 helper kernel uses fp16 v_dot2 instructions only");
+  } else {
+    TORCH_CHECK(false, "gptq_gemm_rdna2 only supports fp16; got dtype=",
+                a.scalar_type());
   }
 }
