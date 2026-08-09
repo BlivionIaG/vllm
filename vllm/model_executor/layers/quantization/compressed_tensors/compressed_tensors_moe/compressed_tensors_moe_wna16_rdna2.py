@@ -95,12 +95,16 @@ class CompressedTensorsWNA16RDNA2MoEMethod(CompressedTensorsWNA16MoEMethod):
 
         w13_qz = _synthesize_qzeros(w13_groups, w13_N, device)
         w2_qz = _synthesize_qzeros(w2_groups, w2_N, device)
+        # Stride-0 broadcast: kernel uses b_qzeros.stride(0) for expert offset,
+        # so an unsqueeze+expand view (stride 0 on dim 0) shares one storage
+        # across all experts instead of materializing num_experts copies.
+        # Saves ~(E-1) * (groups * N/8 * 4) bytes per layer.
         layer.w13_qzeros = torch.nn.Parameter(
-            w13_qz.unsqueeze(0).expand(num_experts, -1, -1).contiguous(),
+            w13_qz.unsqueeze(0).expand(num_experts, -1, -1),
             requires_grad=False,
         )
         layer.w2_qzeros = torch.nn.Parameter(
-            w2_qz.unsqueeze(0).expand(num_experts, -1, -1).contiguous(),
+            w2_qz.unsqueeze(0).expand(num_experts, -1, -1),
             requires_grad=False,
         )
 

@@ -58,6 +58,10 @@ class Fp8MoeBackend(Enum):
     # Dequantize-to-BF16 emulation for MXFP8 on devices without a native
     # MXFP8 MoE kernel (e.g. ROCm). Weights pass through unchanged here.
     EMULATION = "EMULATION"
+    # RDNA2 (gfx1030) native W8A16-FP8 fused MoE. Falls back to the
+    # RDNA2 fused MoE kernel which does per-tile FP8->fp16 conversion
+    # before v_dot2_f32_f16. Storage stays FP8 (no requant on disk).
+    RDNA2_W8A16_FP8 = "RDNA2_W8A16_FP8"
     # MXFP8 MoE via a Triton ``dot_scaled`` kernel that lowers to CDNA4
     # (gfx950) native MX matrix-core ops. Weights stay in MXFP8 (no load-time
     # format conversion); the FP8 values + E8M0 scales are consumed directly.
@@ -130,6 +134,11 @@ def _get_priority_backends(
         # CPU platform uses FP8 W8A16 fused MoE kernel.
         _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.CPU)
 
+    if current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx10x
+        if on_gfx10x():
+            _move_to_front(_AVAILABLE_BACKENDS, Fp8MoeBackend.RDNA2_W8A16_FP8)
+
     return _AVAILABLE_BACKENDS
 
 
@@ -184,6 +193,13 @@ def backend_to_kernel_cls(
         )
 
         return [MarlinExperts]
+
+    elif backend == Fp8MoeBackend.RDNA2_W8A16_FP8:
+        from vllm.model_executor.layers.fused_moe.experts.rdna2_w8a16_fp8_moe import (
+            RDNA2W8A16FP8Experts,
+        )
+
+        return [RDNA2W8A16FP8Experts]
 
     elif backend == Fp8MoeBackend.TRITON:
         from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
