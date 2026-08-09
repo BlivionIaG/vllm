@@ -705,12 +705,7 @@ def moe_gptq_gemm_rdna2(
     mul_topk_weight: bool,
     output_topk: int = 0,
 ) -> None:
-    # Schema dispatch in torch 2.12 enforces ScalarType::Float on the
-    # unannotated Tensor argument for `topk_weights` (it is the only
-    # `Tensor` after the 6th position whose default dtype is constrained).
-    # The kernel reads `topk_weights.data_ptr<float>()` unconditionally
-    # (see moe_q_gemm_rdna2.cu:363), so cast once here.
-    if topk_weights.dtype != torch.float32:
+    if topk_weights.numel() > 0 and topk_weights.dtype != torch.float32:
         topk_weights = topk_weights.float()
     torch.ops._rocm_C.moe_gptq_gemm_rdna2(
         a,
@@ -748,6 +743,131 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "moe_gptq_gemm_r
         output_topk: int = 0,
     ) -> None:
         return
+
+
+def moe_w8a16_gemm_rdna2(
+    a: torch.Tensor,
+    c: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_qzeros: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    block_size_m: int,
+    mul_topk_weight: bool,
+    output_topk: int = 0,
+) -> None:
+    if topk_weights.numel() > 0 and topk_weights.dtype != torch.float32:
+        topk_weights = topk_weights.float()
+    torch.ops._rocm_C.moe_w8a16_gemm_rdna2(
+        a,
+        c,
+        b_q_weight,
+        b_scales,
+        b_qzeros,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        block_size_m,
+        mul_topk_weight,
+        output_topk,
+    )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "moe_w8a16_gemm_rdna2"
+):
+
+    @register_fake("_rocm_C::moe_w8a16_gemm_rdna2")
+    def _moe_w8a16_gemm_rdna2_fake(
+        a: torch.Tensor,
+        c: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_scales: torch.Tensor,
+        b_qzeros: torch.Tensor,
+        topk_weights: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_tokens_post_padded: torch.Tensor,
+        top_k: int,
+        block_size_m: int,
+        mul_topk_weight: bool,
+        output_topk: int = 0,
+    ) -> None:
+        return
+
+
+def moe_w8a16_fp8_gemm_rdna2(
+    a: torch.Tensor,
+    c: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    b_qzeros: torch.Tensor,
+    topk_weights: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    top_k: int,
+    block_size_m: int,
+    mul_topk_weight: bool,
+    output_topk: int = 0,
+) -> None:
+    if topk_weights.numel() > 0 and topk_weights.dtype != torch.float32:
+        topk_weights = topk_weights.float()
+    torch.ops._rocm_C.moe_w8a16_fp8_gemm_rdna2(
+        a,
+        c,
+        b_q_weight,
+        b_scales,
+        b_qzeros,
+        topk_weights,
+        sorted_token_ids,
+        expert_ids,
+        num_tokens_post_padded,
+        top_k,
+        block_size_m,
+        mul_topk_weight,
+        output_topk,
+    )
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(
+    torch.ops._rocm_C, "moe_w8a16_fp8_gemm_rdna2"
+):
+
+    @register_fake("_rocm_C::moe_w8a16_fp8_gemm_rdna2")
+    def _moe_w8a16_fp8_gemm_rdna2_fake(
+        a: torch.Tensor,
+        c: torch.Tensor,
+        b_q_weight: torch.Tensor,
+        b_scales: torch.Tensor,
+        b_qzeros: torch.Tensor,
+        topk_weights: torch.Tensor,
+        sorted_token_ids: torch.Tensor,
+        expert_ids: torch.Tensor,
+        num_tokens_post_padded: torch.Tensor,
+        top_k: int,
+        block_size_m: int,
+        mul_topk_weight: bool,
+        output_topk: int = 0,
+    ) -> None:
+        return
+
+
+def gemm_w8a16_fp8_dense(
+    a: torch.Tensor,
+    b_q_weight: torch.Tensor,
+    b_scales: torch.Tensor,
+    c: torch.Tensor,
+    group_size: int,
+) -> None:
+    torch.ops._rocm_C.gemm_w8a16_fp8_dense(
+        a, b_q_weight, b_scales, c, group_size)
 
 
 def gptq_gemm_rdna3(
