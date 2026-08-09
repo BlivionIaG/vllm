@@ -759,16 +759,20 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
         # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
         # ``w{1,2,3}_weight_scale`` (no _inv suffix). FP8 linear and
         # shared experts use Fp8LinearMethod's block scales, which
-        # register as ``weight_scale_inv``.
+        # register as ``weight_scale_inv``. Shared experts use the W8A8
+        # BLOCK scheme and keep the parameter as ``weight_scale``.
         scale_regex = {
             re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
+            re.compile(r"(\.shared_experts\.\w+)\.scale$"): r"\1.weight_scale",
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
     else:
         # FP8 experts use Fp8MoEMethod (block_quant=True), which registers
         # scales as ``w{13,2}_weight_scale_inv``. Map all ``.scale`` keys
-        # there.
+        # there. EXCEPT shared_experts which uses the W8A8 BLOCK scheme
+        # that keeps the parameter as ``weight_scale`` (no _inv suffix).
         scale_regex = {
+            re.compile(r"(\.shared_experts\.\w+)\.scale$"): r"\1.weight_scale",
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
     return WeightsMapper(
