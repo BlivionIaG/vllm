@@ -121,13 +121,14 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         if self.strategy == QuantizationStrategy.BLOCK:
             assert self.is_static_input_scheme is False
             # MarlinFP8ScaledMMLinearKernel uses "weight_scale_inv" for block
-            # quant, while CT registers the scale as "weight_scale".
-            # Rename by deleting the old parameter and adding the new one so
-            # that prepare_fp8_layer_for_marlin (which prefers "weight_scale"
-            # over "weight_scale_inv") picks up "weight_scale_inv" correctly.
-            weight_scale_data = layer.weight_scale.data
-            del layer._parameters["weight_scale"]
-            replace_parameter(layer, "weight_scale_inv", weight_scale_data)
+            # quant, while CT registers the scale as "weight_scale". Alias
+            # both names so the RDNA2 kernel (which reads "weight_scale")
+            # and Marlin (which reads "weight_scale_inv") both work.
+            if hasattr(layer, "weight_scale") and not hasattr(
+                layer, "weight_scale_inv"
+            ):
+                weight_scale_data = layer.weight_scale.data
+                replace_parameter(layer, "weight_scale_inv", weight_scale_data)
         else:
             if self.strategy == QuantizationStrategy.TENSOR:
                 # For fused modules with per-tensor scales, expand each scale
