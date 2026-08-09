@@ -95,13 +95,56 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
                 &fa_rdna2_prefill_paged_varlen_splitk);
 
   rocm_ops.def(
-      "moe_gptq_gemm_rdna2(Tensor a, Tensor(a!) c, Tensor b_q_weight, "
+      "moe_gptq_gemm_rdna2(Tensor a, Tensor! c, Tensor b_q_weight, "
       "Tensor(a) b_scales, Tensor b_qzeros, Tensor(a) topk_weights, "
       "Tensor sorted_token_ids, Tensor expert_ids, "
       "Tensor num_tokens_post_padded, "
       "int top_k, int block_size_m, bool mul_topk_weight, "
       "int output_topk) -> ()");
   rocm_ops.impl("moe_gptq_gemm_rdna2", torch::kCUDA, &moe_gptq_gemm_rdna2);
+
+  // W8A16 (INT8 weight + fp16 act) fused MoE kernel for RDNA2.
+  rocm_ops.def(
+      "moe_w8a16_gemm_rdna2(Tensor a, Tensor! c, Tensor b_q_weight, "
+      "Tensor(a) b_scales, Tensor b_qzeros, Tensor(a) topk_weights, "
+      "Tensor sorted_token_ids, Tensor expert_ids, "
+      "Tensor num_tokens_post_padded, "
+      "int top_k, int block_size_m, bool mul_topk_weight, "
+      "int output_topk) -> ()");
+  rocm_ops.impl("moe_w8a16_gemm_rdna2", torch::kCUDA, &moe_w8a16_gemm_rdna2);
+
+  // W8A16-FP8 (FP8 weight + fp16 act) fused MoE kernel for RDNA2.
+  // Disabled 2026-08-05: moe_w8a16_fp8_rdna2.cu excluded from gfx1030 build
+  // (namespace parser error). MoE experts fall back to existing
+  // CompressedTensorsWNA16MoEMethod (INT4) or scaled_mm dispatch.
+  // rocm_ops.def(
+  //     "moe_w8a16_fp8_gemm_rdna2(Tensor a, Tensor! c, Tensor b_q_weight, "
+  //     "Tensor(a) b_scales, Tensor b_qzeros, Tensor(a) topk_weights, "
+  //     "Tensor sorted_token_ids, Tensor expert_ids, "
+  //     "Tensor num_tokens_post_padded, "
+  //     "int top_k, int block_size_m, bool mul_topk_weight, "
+  //     "int output_topk) -> ()");
+  // rocm_ops.impl("moe_w8a16_fp8_gemm_rdna2", torch::kCUDA,
+  //               &moe_w8a16_fp8_gemm_rdna2);
+
+  // W8A16-FP8 dense linear kernel for RDNA2 (gfx1030). Per-tile FP8->fp16
+  // conversion via constant-memory LUT, then v_dot2_f32_f16. Atomic-add
+  // epilogue into a pre-zeroed fp16 output.
+  rocm_ops.def(
+      "gemm_w8a16_fp8_dense(Tensor a, Tensor b_q_weight, Tensor b_scales, "
+      "Tensor(a!) c, int group_size) -> ()");
+  rocm_ops.impl("gemm_w8a16_fp8_dense", torch::kCUDA,
+                &gemm_w8a16_fp8_dense);
+
+  // Paged MQA logits for DeepSeek V4 Lightning Indexer (gfx1030).
+  // Replaces the AITER-only decode path of rocm_aiter_sparse_attn_indexer.
+  rocm_ops.def(
+      "paged_mqa_logits_decode_rdna2(Tensor q_fp8, Tensor kv_cache, "
+      "Tensor weights, Tensor context_lens, Tensor block_tables, "
+      "int max_model_len) -> Tensor");
+  rocm_ops.impl("paged_mqa_logits_decode_rdna2", torch::kCUDA,
+                &paged_mqa_logits_decode_rdna2);
+
 #endif
 
 #ifdef VLLM_ROCM_GFX1100

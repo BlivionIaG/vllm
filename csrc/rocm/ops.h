@@ -112,3 +112,41 @@ void moe_gptq_gemm_rdna2(torch::Tensor a, torch::Tensor c,
                          torch::Tensor num_tokens_post_padded, int64_t top_k,
                          int64_t block_size_m, bool mul_topk_weight,
                          int64_t output_topk);
+
+void moe_w8a16_gemm_rdna2(torch::Tensor a, torch::Tensor c,
+                           torch::Tensor b_q_weight, torch::Tensor b_scales,
+                           torch::Tensor b_qzeros, torch::Tensor topk_weights,
+                           torch::Tensor sorted_token_ids,
+                           torch::Tensor expert_ids,
+                           torch::Tensor num_tokens_post_padded,
+                           int64_t top_k, int64_t block_size_m,
+                           bool mul_topk_weight, int64_t output_topk);
+
+void moe_w8a16_fp8_gemm_rdna2(torch::Tensor a, torch::Tensor c,
+                               torch::Tensor b_q_weight,
+                               torch::Tensor b_scales,
+                               torch::Tensor b_qzeros,
+                               torch::Tensor topk_weights,
+                               torch::Tensor sorted_token_ids,
+                               torch::Tensor expert_ids,
+                               torch::Tensor num_tokens_post_padded,
+                               int64_t top_k, int64_t block_size_m,
+                               bool mul_topk_weight, int64_t output_topk);
+
+// W8A16-FP8 dense linear kernel for AMD RDNA2 (gfx1030).
+// Per-tile FP8 (E4M3) -> fp16 dequant via 256-entry LUT, then v_dot2_f32_f16.
+void gemm_w8a16_fp8_dense(torch::Tensor a, torch::Tensor b_q_weight,
+                          torch::Tensor b_scales, torch::Tensor c,
+                          int64_t group_size);
+
+// Paged MQA logits for DeepSeek V4 Lightning Indexer on AMD RDNA2
+// (gfx1030). AITER is CDNA-only and crashes on gfx1030; this kernel
+// replaces `rocm_aiter_sparse_attn_indexer`'s paged MQA logits stage
+// with a fused FP8 dequant + dot-product + ReLU + per-head weighted
+// sum kernel. Output is logits [B*next_n, max_model_len] fp32 with -inf
+// in padded slots. Top-K selection is done by the standard upstream
+// `top_k_per_row_decode` kernel (runs on gfx1030).
+torch::Tensor paged_mqa_logits_decode_rdna2(
+    torch::Tensor q_fp8, torch::Tensor kv_cache, torch::Tensor weights,
+    torch::Tensor context_lens, torch::Tensor block_tables,
+    int64_t max_model_len);
