@@ -72,6 +72,9 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "KimiLinearConfig": "vllm.transformers_utils.configs.kimi_linear",
     "KimiVLConfig": "vllm.transformers_utils.configs.kimi_vl",
     "KimiK25Config": "vllm.transformers_utils.configs.kimi_k25",
+    "MuseGlimmerConfig": "vllm.transformers_utils.configs.muse_glimmer",
+    "MuseGlimmerTextConfig": "vllm.transformers_utils.configs.muse_glimmer",
+    "MuseGlimmerVisionConfig": "vllm.transformers_utils.configs.muse_glimmer",
     "NemotronConfig": "vllm.transformers_utils.configs.nemotron",
     "NemotronHConfig": "vllm.transformers_utils.configs.nemotron_h",
     "OlmoHybridConfig": "vllm.transformers_utils.configs.olmo_hybrid",
@@ -100,6 +103,8 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "InklingMMConfig": "vllm.models.inkling.configs",
     # Special case: DeepseekV3Config is from HuggingFace Transformers
     "DeepseekV3Config": "transformers",
+    # Same: the Muse Glimmer draft head is a DFlash head with a Qwen3-shaped config.
+    "Qwen3Config": "transformers",
 }
 
 __all__ = [
@@ -123,6 +128,7 @@ __all__ = [
     "DiffusionGemmaTextConfig",
     "DeepseekVLV2Config",
     "DeepseekV3Config",
+    "Qwen3Config",
     "DeepseekV4Config",
     "DotsOCRConfig",
     "EAGLEConfig",
@@ -156,6 +162,9 @@ __all__ = [
     "KimiLinearConfig",
     "KimiVLConfig",
     "KimiK25Config",
+    "MuseGlimmerConfig",
+    "MuseGlimmerTextConfig",
+    "MuseGlimmerVisionConfig",
     "NemotronConfig",
     "NemotronHConfig",
     "OlmoHybridConfig",
