@@ -434,7 +434,12 @@ def _restride_blocks_first_kv_cache_to_kv_first_storage(
     kv_cache: torch.Tensor,
 ) -> None:
     assert kv_cache.ndim >= 3
-    assert kv_cache.shape[1] == 2
+    if kv_cache.shape[1] != 2:
+        logger.warning_once(
+            "Skipping KV-cache restride: dim-1 is not 2; shape is %s.",
+            kv_cache.shape,
+        )
+        return
     page_size = kv_cache.shape[2:].numel()
     num_blocks = kv_cache.shape[0]
     expected_tail_stride = torch.empty(kv_cache.shape[2:]).stride()
