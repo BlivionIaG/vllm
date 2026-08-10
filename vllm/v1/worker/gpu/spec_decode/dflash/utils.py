@@ -54,7 +54,10 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if hasattr(target_model, "get_language_model")
         else target_model
     )
-    target_inner = target_language_model.model
+    # MuseGlimmerForCausalLM marks its inner MuseGlimmerModel as the language
+    # model, so get_language_model() already returns the inner module and has
+    # no .model of its own.
+    target_inner = getattr(target_language_model, "model", target_language_model)
     draft_inner = dflash_model.model
 
     # Skip embedding sharing under PP — each rank owns its own embedding.

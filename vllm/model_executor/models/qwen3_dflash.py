@@ -375,7 +375,14 @@ class DFlashQwen3DecoderLayer(nn.Module):
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
     hf_to_vllm_mapper = WeightsMapper(
-        orig_to_new_substr={"midlayer.": "layers.0."},
+        orig_to_new_substr={
+            "midlayer.": "layers.0.",
+            # Muse-Glimmer-30B-assistant names the aux-hidden-state encoder
+            # `encoder.fc` / `encoder.output_norm_enc`; this head calls them
+            # `fc` / `hidden_norm`. Same tensors and shapes, different names.
+            "encoder.output_norm_enc.": "hidden_norm.",
+            "encoder.fc.": "fc.",
+        },
         orig_to_new_stacked={
             ".q_proj": (".qkv_proj", "q"),
             ".k_proj": (".qkv_proj", "k"),

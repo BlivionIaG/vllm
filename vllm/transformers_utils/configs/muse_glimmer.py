@@ -14,6 +14,7 @@ and vision configs are consumed by the native multimodal serving path.
 
 from __future__ import annotations
 
+from transformers import Qwen3Config
 from transformers.configuration_utils import PretrainedConfig
 
 
@@ -343,4 +344,43 @@ class MuseGlimmerConfig(PretrainedConfig):
         super().__init__(**kwargs)
 
 
-__all__ = ["MuseGlimmerTextConfig", "MuseGlimmerVisionConfig", "MuseGlimmerConfig"]
+class MuseGlimmerAssistantConfig(Qwen3Config):
+    """Config for the Muse Glimmer DFlash draft head.
+
+    The head is Qwen3-shaped and runs on vLLM's generic ``qwen3_dflash``
+    implementation, so this derives from ``Qwen3Config``. It cannot BE
+    ``Qwen3Config``, because two of the checkpoint's values do not survive that
+    class:
+
+    * ``sliding_window`` is gated behind ``use_sliding_window``, which defaults
+      to False -- ``Qwen3Config(sliding_window=2048).sliding_window`` is None.
+      The checkpoint declares ``sliding_window: 2048`` and five
+      ``sliding_attention`` layers, so the window silently disappears and the
+      DFlash path then raises "sliding attention requires a window size".
+    * ``vocab_size`` is absent from the checkpoint, so Qwen3's default of
+      151936 applies instead of Muse Glimmer's 202048. That one is *silent*: it
+      builds an all-zero ``draft_id_to_target_id`` remap, and also puts
+      pad/bos/eos/mask token ids out of range.
+
+    Both defaults are set here so an unmodified checkpoint loads correctly.
+    """
+
+    model_type = "muse_glimmer_assistant"
+
+    def __init__(
+        self,
+        vocab_size: int = 202048,
+        use_sliding_window: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            vocab_size=vocab_size, use_sliding_window=use_sliding_window, **kwargs
+        )
+
+
+__all__ = [
+    "MuseGlimmerTextConfig",
+    "MuseGlimmerVisionConfig",
+    "MuseGlimmerConfig",
+    "MuseGlimmerAssistantConfig",
+]
