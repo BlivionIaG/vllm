@@ -145,6 +145,23 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("paged_mqa_logits_decode_rdna2", torch::kCUDA,
                 &paged_mqa_logits_decode_rdna2);
 
+  // Sparse MLA decode for DeepSeek V4 (gfx1030). Replaces the Triton
+  // _sparse_attn_decode_ragged_kernel path on gfx1030 (the AITER MLA
+  // path is CDNA-only and does not run on gfx1030). 1 CTA per query,
+  // 32 threads (wave32), 2 heads per thread; online softmax with
+  // full acc_nope/acc_rope state in registers. FP8 (E4M3 OCP) K_nope
+  // with E8M0 block scales, bf16 K_rope. Gated by
+  // VLLM_USE_RDNA2_MLA=1 and on_gfx10x().
+  rocm_ops.def(
+      "sparse_mla_decode_rdna2(Tensor q, Tensor main_cache, "
+      "Tensor main_indices, Tensor main_indptr, "
+      "Tensor extra_cache, Tensor extra_indices, Tensor extra_indptr, "
+      "int main_block_size, int main_num_rows, "
+      "int extra_block_size, int extra_num_rows, float scale, "
+      "Tensor attn_sink, Tensor(a!) out) -> ()");
+  rocm_ops.impl("sparse_mla_decode_rdna2", torch::kCUDA,
+                &sparse_mla_decode_rdna2);
+
 #endif
 
 #ifdef VLLM_ROCM_GFX1100

@@ -150,3 +150,26 @@ torch::Tensor paged_mqa_logits_decode_rdna2(
     torch::Tensor q_fp8, torch::Tensor kv_cache, torch::Tensor weights,
     torch::Tensor context_lens, torch::Tensor block_tables,
     int64_t max_model_len);
+
+// Sparse MLA decode for DeepSeek V4 on AMD RDNA2 (gfx1030).
+// Replaces the Triton `_sparse_attn_decode_ragged_kernel` path on
+// gfx1030 (the AITER MLA path is CDNA-only and does not run on
+// gfx1030). One CTA per query, 32 threads (wave32), 2 heads per thread;
+// online softmax with full acc_nope/acc_rope state in registers.
+// FP8 (E4M3 OCP) K_nope with E8M0 block scales, bf16 K_rope. Gated
+// by VLLM_USE_RDNA2_MLA=1 and on_gfx10x().
+void sparse_mla_decode_rdna2(
+    torch::Tensor q,                  // [B, H, D] bf16
+    torch::Tensor main_cache,         // [num_blocks, block_size, 576] uint8
+    torch::Tensor main_indices,       // [nnz] int32
+    torch::Tensor main_indptr,        // [B+1] int32
+    torch::Tensor extra_cache,        // [num_blocks, block_size, 576] uint8 (may be empty)
+    torch::Tensor extra_indices,      // [nnz_extra] int32 (may be empty)
+    torch::Tensor extra_indptr,       // [B+1] int32 (zeroed when no extra)
+    int64_t main_block_size,
+    int64_t main_num_rows,
+    int64_t extra_block_size,
+    int64_t extra_num_rows,
+    double scale,
+    torch::Tensor attn_sink,          // [H] fp32 or empty
+    torch::Tensor out);               // [B, H, D] bf16

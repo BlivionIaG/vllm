@@ -17,11 +17,13 @@ def _has_tilelang_mhc() -> bool:
     if current_platform.is_cuda():
         return True
     if current_platform.is_rocm():
-        from vllm.platforms.rocm import on_gfx942
+        from vllm.platforms.rocm import on_gfx942, on_gfx10x
 
         # TileLang MHC currently produces incorrect results on gfx942. Keep
         # gfx942 on the existing torch/triton fallbacks until that path is fixed.
-        return not on_gfx942()
+        # gfx10x forces fp16 (no native bf16) and the TileLang MHC ops require
+        # bf16, so keep gfx10x on the native fallback as well.
+        return not (on_gfx942() or on_gfx10x())
     return False
 
 
