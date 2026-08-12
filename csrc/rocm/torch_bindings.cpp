@@ -155,6 +155,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   rocm_ops.impl("gemm_w8a16_fp8_dense", torch::kCUDA,
                 &gemm_w8a16_fp8_dense);
 
+  // W8A8-FP8 dense linear kernel for RDNA2 (gfx1030). DeepSeek V4 Flash
+  // attention / shared experts: FP8 weights + FP8 activations, per-tile
+  // FP8->fp16 dequant (no LUT, inline bit-trick), then v_dot2_f32_f16.
+  rocm_ops.def(
+      "gemm_w8a8_fp8_dense(Tensor a_q, Tensor a_scale, Tensor b_q_weight, "
+      "Tensor b_scales, Tensor(a!) c, int group_size) -> ()");
+  rocm_ops.impl("gemm_w8a8_fp8_dense", torch::kCUDA, &gemm_w8a8_fp8_dense);
+
   // Paged MQA logits for DeepSeek V4 Lightning Indexer (gfx1030).
   // Replaces the AITER-only decode path of rocm_aiter_sparse_attn_indexer.
   rocm_ops.def(
