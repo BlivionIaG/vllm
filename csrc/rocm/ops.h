@@ -122,6 +122,15 @@ void moe_w8a16_gemm_rdna2(torch::Tensor a, torch::Tensor c,
                            int64_t top_k, int64_t block_size_m,
                            bool mul_topk_weight, int64_t output_topk);
 
+void moe_mxfp4_gemm_rdna2(torch::Tensor a, torch::Tensor c,
+                           torch::Tensor b_q_weight, torch::Tensor b_scales,
+                           torch::Tensor topk_weights,
+                           torch::Tensor sorted_token_ids,
+                           torch::Tensor expert_ids,
+                           torch::Tensor num_tokens_post_padded,
+                           int64_t top_k, int64_t block_size_m,
+                           bool mul_topk_weight, int64_t output_topk);
+
 void moe_w8a16_fp8_gemm_rdna2(torch::Tensor a, torch::Tensor c,
                                torch::Tensor b_q_weight,
                                torch::Tensor b_scales,
@@ -138,6 +147,14 @@ void moe_w8a16_fp8_gemm_rdna2(torch::Tensor a, torch::Tensor c,
 void gemm_w8a16_fp8_dense(torch::Tensor a, torch::Tensor b_q_weight,
                           torch::Tensor b_scales, torch::Tensor c,
                           int64_t group_size);
+
+// W4A4 MXFP4 dense linear kernel for AMD RDNA2 (gfx1030).
+// E2M1 nibble -> fp16 via 16-entry constant LUT, UE8M0 scale per 32-elem
+// group, then v_dot2_f32_f16. Used for non-MoE MXFP4 layers (attention,
+// shared experts). Atomic-add epilogue into a pre-zeroed fp16 output.
+void mxfp4_gemm_rdna2(torch::Tensor a, torch::Tensor c,
+                      torch::Tensor b_q_weight, torch::Tensor b_scales,
+                      int64_t size_m, int64_t size_n, int64_t size_k);
 
 // Paged MQA logits for DeepSeek V4 Lightning Indexer on AMD RDNA2
 // (gfx1030). AITER is CDNA-only and crashes on gfx1030; this kernel
