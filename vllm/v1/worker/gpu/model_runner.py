@@ -19,6 +19,7 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import os
 import time
 from copy import deepcopy
 from typing import Any, NamedTuple
@@ -26,6 +27,7 @@ from typing import Any, NamedTuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.profiler  # noqa: F401  -- for VLLM_PROFILE_DECODE_KERNELS instrumentation
 
 import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
@@ -117,6 +119,18 @@ from vllm.v1.worker.utils import KVBlockZeroer, copy_kv_cache_blocks_inplace
 logger = init_logger(__name__)
 
 
+_PROFILE_DECODE_TIMING = os.environ.get("VLLM_PROFILE_DECODE_TIMING") == "1"
+# torch.profiler per-kernel instrumentation; orthogonal to the cudaEvent
+# patch above. Records steps [_START_STEP, _END_STEP) into a Chrome trace.
+_PROFILE_DECODE_KERNELS = os.environ.get("VLLM_PROFILE_DECODE_KERNELS") == "1"
+_PROFILE_KERNEL_START_STEP = int(
+    os.environ.get("VLLM_PROFILE_KERNEL_START_STEP", "10"))
+_PROFILE_KERNEL_END_STEP = int(os.environ.get("VLLM_PROFILE_KERNEL_END_STEP",
+                                              "30"))
+_PROFILE_KERNEL_TRACE_DIR = os.environ.get(
+    "VLLM_PROFILE_KERNEL_TRACE_DIR", "/tmp/v77_profile_trace")
+
+
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -131,6 +145,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.observability_config = vllm_config.observability_config
 
         self.device = device
+        if _PROFILE_DECODE_TIMING:
+            self._prof_step = 0
+            self._prof_prep_ms: list[float] = []
+            self._prof_fwd_ms: list[float] = []
+            self._prof_sample_ms: list[float] = []
+            self._prof_wall_total_ms: list[float] = []
+        if _PROFILE_DECODE_KERNELS:
+            self._prof_kernel_step = 0
+            self._prof_kernel_active = False
+            os.makedirs(_PROFILE_KERNEL_TRACE_DIR, exist_ok=True)
+            self._prof_kernel_pid = os.getpid()
+            self._prof_kernel_profiler = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+                with_stack=False,
+            )
         self.dtype = self.model_config.dtype
         self.kv_cache_dtype = self.dtype
         if self.cache_config.cache_dtype != "auto":
@@ -1142,6 +1175,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        _prof_active = _PROFILE_DECODE_TIMING and not dummy_run
+        if _prof_active:
+            _prof_stream = torch.cuda.current_stream()
+            _prof_evt_prep_start = torch.cuda.Event(enable_timing=True)
+            _prof_evt_prep_end = torch.cuda.Event(enable_timing=True)
+            _prof_evt_fwd_end = torch.cuda.Event(enable_timing=True)
+            _prof_evt_sample_end = torch.cuda.Event(enable_timing=True)
+            _prof_wall_start = time.perf_counter()
+            _prof_evt_prep_start.record(_prof_stream)
+        else:
+            _prof_stream = None
+            _prof_evt_prep_start = _prof_evt_prep_end = None
+            _prof_evt_fwd_end = _prof_evt_sample_end = None
+            _prof_wall_start = 0.0
+
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1306,6 +1354,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Update the EPLB meta.
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
+        if _prof_evt_prep_end is not None:
+            _prof_evt_prep_end.record(_prof_stream)
+
+        # Start kernel profiler if entering the active capture window.
+        # Window: [START_STEP, END_STEP) — captures (end - start) decode steps.
+        if (
+            _PROFILE_DECODE_KERNELS
+            and not dummy_run
+            and not self._prof_kernel_active
+            and _PROFILE_KERNEL_START_STEP
+            <= self._prof_kernel_step
+            < _PROFILE_KERNEL_END_STEP
+        ):
+            self._prof_kernel_profiler.start()
+            self._prof_kernel_active = True
+            logger.info(
+                "[profile_kernels] starting trace capture at step %d (pid=%d, dir=%s)",
+                self._prof_kernel_step,
+                self._prof_kernel_pid,
+                _PROFILE_KERNEL_TRACE_DIR,
+            )
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1346,6 +1416,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
+        if _prof_evt_fwd_end is not None:
+            _prof_evt_fwd_end.record(_prof_stream)
+
+        # Stop kernel profiler and export trace when the active window ends.
+        if _PROFILE_DECODE_KERNELS and not dummy_run:
+            self._prof_kernel_step += 1
+            if (
+                self._prof_kernel_active
+                and self._prof_kernel_step >= _PROFILE_KERNEL_END_STEP
+            ):
+                self._prof_kernel_profiler.stop()
+                self._prof_kernel_active = False
+                trace_path = os.path.join(
+                    _PROFILE_KERNEL_TRACE_DIR,
+                    f"trace_pid{self._prof_kernel_pid}.json",
+                )
+                try:
+                    self._prof_kernel_profiler.export_chrome_trace(trace_path)
+                    logger.info(
+                        "[profile_kernels] exported trace to %s (pid=%d)",
+                        trace_path,
+                        self._prof_kernel_pid,
+                    )
+                except Exception as _prof_kernel_err:
+                    logger.warning(
+                        "[profile_kernels] failed to export trace on pid %d: %s",
+                        self._prof_kernel_pid,
+                        _prof_kernel_err,
+                    )
+
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
                 assert isinstance(model_output, tuple)
@@ -1374,6 +1474,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
             return output_intermediate_tensors
+
+        if _prof_active and _prof_evt_sample_end is not None:
+            _prof_evt_sample_end.record(_prof_stream)
+            torch.cuda.synchronize()
+            _prep_ms = _prof_evt_prep_start.elapsed_time(_prof_evt_prep_end)
+            _fwd_ms = _prof_evt_prep_end.elapsed_time(_prof_evt_fwd_end)
+            _sample_ms = _prof_evt_fwd_end.elapsed_time(_prof_evt_sample_end)
+            _wall_ms = (time.perf_counter() - _prof_wall_start) * 1000.0
+            self._prof_prep_ms.append(_prep_ms)
+            self._prof_fwd_ms.append(_fwd_ms)
+            self._prof_sample_ms.append(_sample_ms)
+            self._prof_wall_total_ms.append(_wall_ms)
+            self._prof_step += 1
+            if self._prof_step % 50 == 0 and len(self._prof_prep_ms) >= 10:
+                _sorted_prep = sorted(self._prof_prep_ms)
+                _sorted_fwd = sorted(self._prof_fwd_ms)
+                _sorted_sample = sorted(self._prof_sample_ms)
+                _sorted_wall = sorted(self._prof_wall_total_ms)
+                _n = len(_sorted_prep)
+                _med_prep = _sorted_prep[_n // 2]
+                _med_fwd = _sorted_fwd[_n // 2]
+                _med_sample = _sorted_sample[_n // 2]
+                _med_wall = _sorted_wall[_n // 2]
+                logger.info(
+                    "[profile] step=%d prep=%.2f fwd=%.2f sample=%.2f "
+                    "wall_total=%.2f (ms, median over %d)",
+                    self._prof_step,
+                    _med_prep,
+                    _med_fwd,
+                    _med_sample,
+                    _med_wall,
+                    _n,
+                )
+                self._prof_prep_ms.clear()
+                self._prof_fwd_ms.clear()
+                self._prof_sample_ms.clear()
+                self._prof_wall_total_ms.clear()
         return None
 
     @torch.inference_mode()

@@ -7,6 +7,7 @@ from typing import Any, Optional
 import torch
 from torch.distributed import Backend, ProcessGroup, Store
 
+from vllm import envs
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
@@ -196,7 +197,8 @@ class StatelessGroupCoordinator(GroupCoordinator):
         self.mq_broadcaster = None
 
         self.use_custom_op_call = (
-            current_platform.is_cuda_alike() or current_platform.is_tpu()
+            (current_platform.is_cuda_alike() or current_platform.is_tpu())
+            and not envs.VLLM_DISABLE_CUSTOM_ALL_REDUCE
         )
         self.use_cpu_custom_send_recv = False
 

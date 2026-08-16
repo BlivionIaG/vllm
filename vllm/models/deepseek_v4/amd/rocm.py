@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from dataclasses import dataclass
 from typing import cast
 
 import torch
 
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
 from vllm.models.deepseek_v4.sparse_mla import (
@@ -15,6 +17,7 @@ from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadataBuilder,
 )
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx10x
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
@@ -31,14 +34,20 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
 )
 from vllm.v1.attention.ops.rocm_rdna2_mla_sparse import (
     is_available as _rdna2_mla_available,
+    rocm_rdna2_inv_rope_einsum,
     rocm_rdna2_sparse_attn_decode,
+    rocm_rdna2_sparse_attn_prefill,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
+
+logger = init_logger(__name__)
 
 
 def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
     lengths = lengths.to(dtype=torch.int32).contiguous()
-    indptr = torch.zeros(lengths.shape[0] + 1, dtype=torch.int32, device=lengths.device)
+    # RDNA2 V2 cudagraph-replay: shape[0] can be torch.SymInt; force int() to avoid torch.zeros "unknown parameter type" error.
+    _n = int(lengths.shape[0]) + 1
+    indptr = torch.zeros(_n, dtype=torch.int32, device=lengths.device)
     torch.cumsum(lengths, dim=0, out=indptr[1:])
     return indptr
 
@@ -450,17 +459,33 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         return num_heads
 
+    @property
+    def _kv_ws_dtype(self) -> torch.dtype:
+        return torch.float16 if on_gfx10x() else torch.bfloat16
+
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        # ROCm BF16 reference wo_a path (inverse RoPE + einsum) + wo_b.
-        z = rocm_inv_rope_einsum(
-            self.rotary_emb,
-            o,
-            positions,
-            self.rope_head_dim,
-            self.n_local_groups,
-            self.o_lora_rank,
-            self.wo_a,
-        )
+        # Inverse RoPE + wo_a + wo_b. fp16 on gfx10x, bf16 reference path
+        # (inverse RoPE + einsum) elsewhere.
+        if on_gfx10x():
+            z = rocm_rdna2_inv_rope_einsum(
+                self.rotary_emb,
+                o,
+                positions,
+                self.rope_head_dim,
+                self.n_local_groups,
+                self.o_lora_rank,
+                self.wo_a,
+            )
+        else:
+            z = rocm_inv_rope_einsum(
+                self.rotary_emb,
+                o,
+                positions,
+                self.rope_head_dim,
+                self.n_local_groups,
+                self.o_lora_rank,
+                self.wo_a,
+            )
         return self.wo_b(z.flatten(1))
 
     def forward_mqa(
@@ -481,9 +506,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         attn_metadata = forward_context.attn_metadata
 
         if attn_metadata is None:
-            # Warmup dummy run: no real metadata. Reserve the same bf16
-            # gather workspace _forward_prefill would; the dequantize / topk
-            # / sparse_fwd kernels are skipped this step.
+            # Warmup dummy run: no real metadata. Reserve the same gather
+            # workspace _forward_prefill would; the dequantize / topk /
+            # sparse_fwd kernels are skipped this step.
             swa_only = self.compress_ratio <= 1
             N = (
                 0
@@ -493,7 +518,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             )
             M = N + self.window_size + self.max_num_batched_tokens
             current_workspace_manager().get_simultaneous(
-                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), self._kv_ws_dtype),
             )
             output.zero_()
             return
@@ -579,7 +604,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
         _decode_fn = (
             rocm_rdna2_sparse_attn_decode
-            if _rdna2_mla_available()
+            if on_gfx10x()
             else rocm_sparse_attn_decode
         )
         _decode_fn(
@@ -655,7 +680,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
         workspace_manager = current_workspace_manager()
         kv = workspace_manager.get_simultaneous(
-            ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+            ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), self._kv_ws_dtype),
         )[0]
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE
@@ -677,6 +702,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     use_fnuz=False,
                 )
 
+            if os.environ.get("VLLM_RDNA2_MOE_DEBUG_NAN", "0") == "1":
+                kv[:, N:] = 777.0
+
             swa_block_table = swa_metadata.block_table[num_decodes:]
             dequantize_and_gather_k_cache(
                 kv[:chunk_size],
@@ -688,6 +716,93 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 offset=N,
                 use_fnuz=current_platform.is_fp8_fnuz(),
             )
+
+            if os.environ.get("VLLM_RDNA2_MOE_DEBUG_NAN", "0") == "1":
+                kvw = kv[:chunk_size]
+                sl = seq_lens[chunk_start:chunk_end]
+                gl = gather_lens[chunk_start:chunk_end]
+                n_comp = (
+                    0 if swa_only else int((sl // self.compress_ratio).max().item())
+                )
+                n_swa = int(gl.max().item())
+
+                def _ws(t):
+                    if t is None or t.numel() == 0:
+                        return "empty"
+                    return (
+                        f"max={t.float().abs().max().item():.2f} "
+                        f"inf={torch.isinf(t).sum().item()} "
+                        f"nan={torch.isnan(t).sum().item()}"
+                    )
+
+                logger.warning(
+                    "prefill %s c%d kv-ws full: %s | comp[0:%d]: %s | "
+                    "swa[%d:%d]: %s | seq=%s gather=%s",
+                    self.prefix, chunk_idx, _ws(kvw), n_comp,
+                    _ws(kvw[:, :n_comp] if n_comp else None),
+                    N, N + n_swa, _ws(kvw[:, N:N + n_swa]),
+                    sl.tolist(), gl.tolist())
+
+                if "layers.14." in self.prefix:
+                    try:
+                        _bs = swa_metadata.block_size
+                        _bt = swa_metadata.block_table[num_decodes:]
+                        _c2d = swa_k_cache.view(swa_k_cache.shape[0], -1)
+                        _s0 = int(sl[0].item())
+                        _g0 = int(gl[0].item())
+                        _st = _s0 - _g0
+                        _src = [
+                            int(_bt[0, (_st + p) // _bs].item()) * _bs
+                            + (_st + p) % _bs
+                            for p in range(_g0)
+                        ]
+                        _ins = swa_metadata.slot_mapping[
+                            num_decode_tokens : num_decode_tokens
+                            + num_prefill_tokens
+                        ].tolist()
+                        logger.warning(
+                            "probe14raw: seq=%s gather=%s ins=%s src=%s "
+                            "shape=%s stride0=%d bs=%d",
+                            sl.tolist(), gl.tolist(), _ins[:8], _src[:8],
+                            list(swa_k_cache.shape),
+                            swa_k_cache.stride(0), _bs)
+                        for _p in range(_g0):
+                            _s = _src[_p]
+                            _b, _pp = _s // _bs, _s % _bs
+                            _r = _c2d[_b]
+                            _t = _r[_pp * 576 : (_pp + 1) * 576]
+                            _so = _bs * 576 + _pp * 8
+                            logger.warning(
+                                "probe14raw p%d: blk=%d pos=%d fp8[0:6]=%s "
+                                "scales=%s rope[0:2]=%s",
+                                _p, _b, _pp, _t[:6].tolist(),
+                                _r[_so : _so + 8].tolist(),
+                                _t[448:452].view(torch.bfloat16).tolist())
+                        _rows = kvw[0, N : N + n_swa].float().abs()
+                        logger.warning(
+                            "probe14rows: fp8max=%s ropemax=%s",
+                            [round(_rows[_r2, :448].max().item(), 3)
+                             for _r2 in range(n_swa)],
+                            [round(_rows[_r2, 448:].max().item(), 3)
+                             for _r2 in range(n_swa)])
+                        _test = torch.full(
+                            (1, kvw.shape[1], kvw.shape[2]), 777.0,
+                            dtype=torch.bfloat16, device=kvw.device)
+                        dequantize_and_gather_k_cache(
+                            _test,
+                            swa_k_cache,
+                            seq_lens=sl,
+                            gather_lens=gl,
+                            block_table=_bt[chunk_start:chunk_end],
+                            block_size=_bs,
+                            offset=N,
+                            use_fnuz=current_platform.is_fp8_fnuz(),
+                        )
+                        logger.warning(
+                            "probe14re: fresh-tensor re-gather swa max=%s",
+                            _test[0, N : N + _g0].float().abs().max().item())
+                    except Exception as _e:
+                        logger.warning("probe14raw failed: %r", _e)
 
             query_start = (
                 query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
@@ -709,7 +824,19 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 M,
                 N,
             )
-            rocm_sparse_attn_prefill(
+            if os.environ.get("VLLM_RDNA2_MOE_DEBUG_NAN", "0") == "1":
+                logger.warning(
+                    "prefill %s c%d idx: min=%d max=%d lens=%s M=%d N=%d",
+                    self.prefix, chunk_idx,
+                    int(combined_indices.min().item()),
+                    int(combined_indices.max().item()),
+                    combined_lens.tolist(), M, N)
+            _prefill_fn = (
+                rocm_rdna2_sparse_attn_prefill
+                if on_gfx10x()
+                else rocm_sparse_attn_prefill
+            )
+            _prefill_fn(
                 q=q[query_start:query_end],
                 kv=kv.view(-1, 1, q.shape[-1]),
                 indices=combined_indices,
@@ -721,3 +848,11 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 attn_sink=self.attn_sink,
                 output=output[query_start:query_end],
             )
+            if os.environ.get("VLLM_RDNA2_MOE_DEBUG_NAN", "0") == "1":
+                oc = output[query_start:query_end]
+                logger.warning(
+                    "prefill %s c%d sparse-out: max=%.2f inf=%d nan=%d",
+                    self.prefix, chunk_idx,
+                    oc.float().abs().max().item(),
+                    torch.isinf(oc).sum().item(),
+                    torch.isnan(oc).sum().item())

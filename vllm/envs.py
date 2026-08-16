@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
+    VLLM_DISABLE_CUSTOM_ALL_REDUCE: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
@@ -1152,6 +1153,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so that vLLM can verify if p2p is actually working.
     # See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa
     "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
+    # Force collectives through NCCL/torch.distributed, bypassing
+    # torch.ops.vllm.all_reduce. Required on ROCm: custom_all_reduce.cu
+    # is CUDA-only and cannot dispatch on HIP.
+    "VLLM_DISABLE_CUSTOM_ALL_REDUCE": lambda: (
+        os.getenv("VLLM_DISABLE_CUSTOM_ALL_REDUCE", "False").lower()
+        in ("true", "1")
+    ),
     # List of quantization kernels that should be disabled, used for testing
     # and performance comparisons. Currently only affects MPLinearKernel
     # selection

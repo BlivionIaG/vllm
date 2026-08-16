@@ -118,13 +118,18 @@ __global__ void gemm_mxfp4_kernel_rdna2(
   int k = offset_k;
   while (k < end_k) {
     // Load 4 scale bytes for the 4 N columns handled by this thread.
+    // Each int32 weight word holds 8 consecutive K nibbles of ONE N column,
+    // and dequant_e2m1_8_fp16 multiplies half2 lanes elementwise, so each
+    // column's scale must be broadcast to both lanes.
     half s0 = ue8m0_to_fp16(s_ptr[0]);
     half s1 = ue8m0_to_fp16(s_ptr[1]);
     half s2 = ue8m0_to_fp16(s_ptr[2]);
     half s3 = ue8m0_to_fp16(s_ptr[3]);
-    half2 scale01 = __halves2half2(s0, s1);
-    half2 scale23 = __halves2half2(s2, s3);
-    s_ptr += 4 * size_n;
+    half2 scale0 = __halves2half2(s0, s0);
+    half2 scale1 = __halves2half2(s1, s1);
+    half2 scale2b = __halves2half2(s2, s2);
+    half2 scale3 = __halves2half2(s3, s3);
+    s_ptr += size_n;  // one scale row per 32-K iteration
 
     // Prefetch 4 weight words (128 bytes)
     int4 b_w[4];
@@ -139,10 +144,10 @@ __global__ void gemm_mxfp4_kernel_rdna2(
       const int a_off = (k - offset_k) + 8 * j;
 
       half2 dq[4], dq2[4], dq3[4], dq4[4];
-      dequant_e2m1_8_fp16((uint32_t)b_w[j].x, scale01, dq);
-      dequant_e2m1_8_fp16((uint32_t)b_w[j].y, scale01, dq2);
-      dequant_e2m1_8_fp16((uint32_t)b_w[j].z, scale23, dq3);
-      dequant_e2m1_8_fp16((uint32_t)b_w[j].w, scale23, dq4);
+      dequant_e2m1_8_fp16((uint32_t)b_w[j].x, scale0, dq);
+      dequant_e2m1_8_fp16((uint32_t)b_w[j].y, scale1, dq2);
+      dequant_e2m1_8_fp16((uint32_t)b_w[j].z, scale2b, dq3);
+      dequant_e2m1_8_fp16((uint32_t)b_w[j].w, scale3, dq4);
 
 #pragma unroll
       for (int m = 0; m < M_COUNT; ++m) {
@@ -276,7 +281,10 @@ void mxfp4_gemm_rdna2(torch::Tensor a, torch::Tensor c,
   auto stream = at::cuda::getCurrentCUDAStream();
 
   // Byte-equivalent cast: uint8 and uint32 views of the same storage.
-  const uint8_t* b_qw_bytes = b_q_weight.data_ptr<uint8_t>();
+  // Use untyped data_ptr() — the typed data_ptr<uint8_t>() would throw
+  // "expected scalar type Byte" when the caller passes a uint32 view.
+  const uint8_t* b_qw_bytes =
+      static_cast<const uint8_t*>(b_q_weight.data_ptr());
 
   if (a.scalar_type() == torch::kHalf) {
     vllm::mxfp4_dot2::launch_gemm_mxfp4<half>(

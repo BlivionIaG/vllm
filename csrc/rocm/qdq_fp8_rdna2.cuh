@@ -46,9 +46,12 @@ __forceinline__ __device__ uint16_t fp8_e4m3_to_fp16_bits(uint8_t fp8) {
       m = (uint16_t)(m & 0x7);
       bits = (uint16_t)((sign << 15) | ((e + 15) << 10) | (m << 7));
     }
-  } else if (exp8 == 0xF) {
-    // Inf (mant=0) or NaN (mant!=0)
-    bits = (uint16_t)((sign << 15) | (0x1F << 10) | (mant8 << 7) | 0x200);
+  } else if (exp8 == 0xF && mant8 == 0x7) {
+    // OCP E4M3 (e4m3fn) has NO infinity: S.1111.111 is the only NaN
+    // encoding. exp=0xF with mant 0..6 are normal values 256..448 and
+    // MUST NOT be mapped to fp16 Inf/NaN (absmax-scaled weights hit 448
+    // constantly, which would NaN the whole GEMM).
+    bits = (uint16_t)((sign << 15) | (0x1F << 10) | 0x200);
   } else {
     // Normal: shift exponent bias 7 -> 15
     bits = (uint16_t)((sign << 15) | (((exp8 - 7) + 15) << 10) | (mant8 << 7));

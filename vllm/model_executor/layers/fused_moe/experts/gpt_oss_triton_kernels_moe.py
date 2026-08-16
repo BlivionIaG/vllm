@@ -913,6 +913,7 @@ class BaseOAITritonExperts(mk.FusedMoEExpertsModular):
     ) -> bool:
         SUPPORTED_W_A = [
             (kMxfp4Static, None),
+            (kMxfp4Static, kFp8StaticTensorSym),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A
 

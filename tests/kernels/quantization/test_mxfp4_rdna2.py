@@ -98,7 +98,8 @@ def _ue8m0_to_fp16_scale(scale_byte: torch.Tensor) -> torch.Tensor:
     Returns a float16 tensor with the same shape as ``scale_byte``.
     """
     bits = (scale_byte.to(torch.int32) - 112) << 10
-    return bits.to(torch.int32).view(torch.float16)
+    # via int16 so view() keeps element count (int32 view would split each in two)
+    return bits.to(torch.int16).view(torch.float16)
 
 
 def _make_e2m1_weights(E: int, K: int, N: int) -> torch.Tensor:

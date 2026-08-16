@@ -741,7 +741,11 @@ class RocmPlatform(Platform):
     @lru_cache(maxsize=8)
     def get_device_name(cls, device_id: int = 0) -> str:
         physical_device_id = cls.device_id_to_physical_device_id(device_id)
-        handle = amdsmi_get_processor_handles()[physical_device_id]
+        try:
+            handle = amdsmi_get_processor_handles()[physical_device_id]
+        except IndexError:
+            # GPU assignment quirk: worker may bind outside visible range.
+            return f"RDNA2_gpu_{physical_device_id}"
         asic_info = amdsmi_get_gpu_asic_info(handle)
         asic_info_device_id: str = asic_info["device_id"]
         if asic_info_device_id in _ROCM_DEVICE_ID_NAME_MAP:

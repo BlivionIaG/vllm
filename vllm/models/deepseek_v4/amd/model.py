@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -7,6 +8,10 @@ from itertools import islice
 import regex as re
 import torch
 import torch.nn as nn
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 from vllm.config import VllmConfig
 from vllm.distributed import (
@@ -404,13 +409,27 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> tuple[
         torch.Tensor, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
     ]:
+        _dbg = os.environ.get("VLLM_RDNA2_MOE_DEBUG_NAN", "0") == "1"
+
+        def _nanct(t: torch.Tensor) -> int:
+            return torch.isnan(t).sum().item()
+
         residual = x
+        if _dbg:
+            logger.warning("layer-in: nan=%d max=%.1f", _nanct(x),
+                           x.float().abs().max().item())
         x, post, comb = self.hc_pre(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
         x = self.attn_norm(x)
         x = self.attn(positions, x, None)
+        if _dbg:
+            logger.warning("attn-out: nan=%d max=%.1f", _nanct(x),
+                           x.float().abs().max().item())
         x = self.hc_post(x, residual, post, comb)
+        if _dbg:
+            logger.warning("hc-post-attn: nan=%d max=%.1f", _nanct(x),
+                           x.float().abs().max().item())
 
         residual = x
         x, post, comb = self.hc_pre(
@@ -418,6 +437,9 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
         x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
+        if _dbg:
+            logger.warning("ffn-out: nan=%d max=%.1f", _nanct(x),
+                           x.float().abs().max().item())
         x = self.hc_post(x, residual, post, comb)
         return x, None, None, None
 
@@ -453,6 +475,38 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
+
+        # Prefer the unfused HF shared-expert layout (w1/w2/w3) over the
+        # fused duplicates, but only if the unfused tensors really exist:
+        # corrupt conversions can leave dangling index.json entries.
+        self._skip_fused_shared_experts = False
+        index_path = os.path.join(
+            vllm_config.model_config.model, "model.safetensors.index.json"
+        )
+        if os.path.isfile(index_path):
+            import json
+
+            from safetensors import safe_open
+
+            with open(index_path) as f:
+                weight_map = json.load(f)["weight_map"]
+            w1_key = next(
+                (
+                    k
+                    for k in weight_map
+                    if ".shared_experts.w1.weight" in k
+                ),
+                None,
+            )
+            if w1_key is not None:
+                shard_path = os.path.join(
+                    vllm_config.model_config.model, weight_map[w1_key]
+                )
+                try:
+                    with safe_open(shard_path, framework="np") as f:
+                        self._skip_fused_shared_experts = w1_key in f.keys()
+                except Exception:
+                    self._skip_fused_shared_experts = False
 
         # Three aux streams: one per non-default input GEMM in
         # DeepseekV4Attention.attn_gemm_parallel_execute
@@ -598,6 +652,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 res_mix,
                 residual,
             )
+            if os.environ.get("VLLM_RDNA2_MOE_DEBUG_NAN", "0") == "1":
+                nan_ct = torch.isnan(hidden_states).sum().item()
+                if idx < 6 or nan_ct > 0:
+                    logger.warning(
+                        "layer %d out: max=%.1f nan=%d inf=%d",
+                        idx, hidden_states.float().abs().max().item(),
+                        nan_ct, torch.isinf(hidden_states).sum().item())
             if (idx + 1) in self.aux_hidden_state_layers:
                 # On the unfused (aiter) path the layer already applied hc_post,
                 # so hidden_states is the reconstructed stream; on the fused
@@ -668,6 +729,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         expert_mapping = self.get_expert_mapping()
 
         for name, loaded_weight in weights:
+            if self._skip_fused_shared_experts and (
+                ".shared_experts.gate_up_proj." in name
+                or ".shared_experts.down_proj." in name
+            ):
+                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if ".experts." in name:
@@ -694,32 +760,59 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         and loaded_weight.dtype == torch.float8_e8m0fnu
                     ):
                         loaded_weight = loaded_weight.view(torch.uint8)
-                    for mapping in expert_mapping:
-                        param_name, weight_name, expert_id, expert_shard_id = mapping
-                        if weight_name not in name:
-                            continue
-                        name_mapped = name.replace(weight_name, param_name)
-                        if is_pp_missing_parameter(name_mapped, self):
-                            continue
-                        param = params_dict[name_mapped]
-                        # We should ask the weight loader to return success or not
-                        # here since otherwise we may skip experts with other
-                        # available replicas.
-                        weight_loader = typing.cast(
-                            Callable[..., bool], param.weight_loader
-                        )
-                        success = weight_loader(
-                            param,
-                            loaded_weight,
-                            name_mapped,
-                            shard_id=expert_shard_id,
-                            expert_id=expert_id,
-                            return_success=True,
-                        )
-                        if success:
-                            name = name_mapped
-                            break
-                    loaded_params.add(name_mapped)
+                    # Some checkpoints store routed experts fused as
+                    # experts.N.gate_up_proj / experts.N.down_proj. Split
+                    # gate_up into w1 (gate) / w3 (up) row halves so the
+                    # unfused mapping entries and TP-slicing loaders apply.
+                    sub_loads = [(name, loaded_weight)]
+                    if ".gate_up_proj." in name:
+                        half = loaded_weight.shape[0] // 2
+                        sub_loads = [
+                            (
+                                name.replace(".gate_up_proj.", ".w1."),
+                                loaded_weight[:half],
+                            ),
+                            (
+                                name.replace(".gate_up_proj.", ".w3."),
+                                loaded_weight[half:],
+                            ),
+                        ]
+                    elif ".down_proj." in name:
+                        sub_loads = [
+                            (name.replace(".down_proj.", ".w2."), loaded_weight)
+                        ]
+                    for sub_name, sub_weight in sub_loads:
+                        name_mapped = None
+                        for mapping in expert_mapping:
+                            param_name, weight_name, expert_id, shard_id = mapping
+                            if weight_name not in sub_name:
+                                continue
+                            name_mapped = sub_name.replace(weight_name, param_name)
+                            if is_pp_missing_parameter(name_mapped, self):
+                                continue
+                            param = params_dict.get(name_mapped)
+                            if param is None:
+                                # e.g. MTP experts when MTP is not built
+                                name_mapped = None
+                                break
+                            # We should ask the weight loader to return success or not
+                            # here since otherwise we may skip experts with other
+                            # available replicas.
+                            weight_loader = typing.cast(
+                                Callable[..., bool], param.weight_loader
+                            )
+                            success = weight_loader(
+                                param,
+                                sub_weight,
+                                name_mapped,
+                                shard_id=shard_id,
+                                expert_id=expert_id,
+                                return_success=True,
+                            )
+                            if success:
+                                break
+                        if name_mapped is not None:
+                            loaded_params.add(name_mapped)
                     continue
                 elif "attn_sink" in name:
                     if is_pp_missing_parameter(name, self):
@@ -759,11 +852,12 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
         # MXFP4 experts use Mxfp4MoEMethod, which registers scales as
         # ``w{1,2,3}_weight_scale`` (no _inv suffix). FP8 linear and
         # shared experts use Fp8LinearMethod's block scales, which
-        # register as ``weight_scale_inv``. Shared experts use the W8A8
-        # BLOCK scheme and keep the parameter as ``weight_scale``.
+        # register as ``weight_scale_inv``.
         scale_regex = {
             re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
-            re.compile(r"(\.shared_experts\.\w+)\.scale$"): r"\1.weight_scale",
+            re.compile(
+                r"(\.shared_experts\.(?:gate_up|down)_proj)\.weight_scale$"
+            ): r"\1.weight_scale_inv",
             re.compile(r"\.scale$"): ".weight_scale_inv",
         }
     else:

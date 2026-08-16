@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -903,6 +905,23 @@ class SparseAttnIndexer(CustomOp):
             seq_lens[:, -1].contiguous() if seq_lens.dim() > 1
             else seq_lens.contiguous()
         )
+        if os.environ.get("VLLM_PAGED_MQA_DEBUG_OOB") == "1":
+            import logging
+            logging.getLogger(__name__).warning(
+                "[MQA_DBG] q_fp8=%s padded_q=%s weights=%s seq_lens_1d=%s vals=%s "
+                "block_table=%s btmax=%d btmin=%d kv=%s kvs0=%d kvs1=%d bs=%d "
+                "num_pages=%d max_model_len=%d next_n=%d decode_tokens=%d",
+                tuple(q_fp8.shape), tuple(padded_q.shape),
+                tuple(weights.shape), tuple(seq_lens_1d.shape),
+                seq_lens_1d.tolist(),
+                tuple(decode_meta.block_table.shape),
+                int(decode_meta.block_table.max().item()),
+                int(decode_meta.block_table.min().item()),
+                tuple(kv_cache_view.shape), kv_cache_view.stride(0),
+                kv_cache_view.stride(1), kv_cache_view.shape[1],
+                int(kv_cache_view.shape[0]), self.max_model_len,
+                next_n, num_decode_tokens,
+            )
         logits = torch.ops._rocm_C.paged_mqa_logits_decode_rdna2(
             padded_q.view(torch.uint8),
             kv_cache_view,

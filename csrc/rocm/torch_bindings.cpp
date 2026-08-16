@@ -11,7 +11,7 @@
 // https://docs.google.com/document/d/1_W62p8WJOQQUzPsJYa7s701JXt0qf2OfLub2sbkHOaU/edit#heading=h.ptttacy8y1u9
 // https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#annotations
 
-TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
+TORCH_LIBRARY(_rocm_C, rocm_ops) {
   // vLLM custom ops for rocm
 
   // Custom gemm op for matrix-vector multiplication
@@ -117,7 +117,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // RDNA2 (gfx1030). Native V_DOT2 path; no Marlin/CUTLASS fallback.
   rocm_ops.def(
       "moe_mxfp4_gemm_rdna2(Tensor a, Tensor! c, Tensor b_q_weight, "
-      "Tensor b_scales, Tensor(a) topk_weights, "
+      "Tensor b_scales, Tensor topk_weights, "
       "Tensor sorted_token_ids, Tensor expert_ids, "
       "Tensor num_tokens_post_padded, "
       "int top_k, int block_size_m, bool mul_topk_weight, "
@@ -158,9 +158,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
   // W8A8-FP8 dense linear kernel for RDNA2 (gfx1030). DeepSeek V4 Flash
   // attention / shared experts: FP8 weights + FP8 activations, per-tile
   // FP8->fp16 dequant (no LUT, inline bit-trick), then v_dot2_f32_f16.
+  // a_scale: [1] / [M] / [M, K/gs] (per-block-K dynamic act quant).
+  // a_scale_K_groups: number of K-blocks in a_scale (1 for per-row/tensor).
   rocm_ops.def(
       "gemm_w8a8_fp8_dense(Tensor a_q, Tensor a_scale, Tensor b_q_weight, "
-      "Tensor b_scales, Tensor(a!) c, int group_size) -> ()");
+      "Tensor b_scales, Tensor(a!) c, int group_size, int a_scale_K_groups) -> ()");
   rocm_ops.impl("gemm_w8a8_fp8_dense", torch::kCUDA, &gemm_w8a8_fp8_dense);
 
   // Paged MQA logits for DeepSeek V4 Lightning Indexer (gfx1030).

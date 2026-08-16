@@ -168,6 +168,9 @@ from vllm.model_executor.kernels.linear.scaled_mm.rdna2_w8a16_fp8 import (
 from vllm.model_executor.kernels.linear.scaled_mm.rdna2_w8a16_fp8_block import (
     RDNA2W8A16Fp8BlockLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.rdna2_w8a8_fp8 import (
+    RDNA2W8A8FP8LinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.deep_gemm import (
     DeepGemmFp8BlockScaledMMKernel,
 )
@@ -345,6 +348,7 @@ _POSSIBLE_FP8_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]]] =
         AiterPreshuffledPerTokenFp8ScaledMMLinearKernel,
         AiterPerTokenFp8ScaledMMLinearKernel,
         ROCmFP8ScaledMMLinearKernel,
+        RDNA2W8A16FP8LinearKernel,
         PerTensorTorchFP8ScaledMMLinearKernel,
         RowWiseTorchFP8ScaledMMLinearKernel,
         ChannelWiseTorchFP8ScaledMMLinearKernel,
@@ -372,8 +376,13 @@ _POSSIBLE_FP8_BLOCK_KERNELS: dict[
         TritonFp8BlockScaledMMKernel,
         HummingFP8ScaledMMLinearKernel,
     ],
-    PlatformEnum.ROCM: [
+PlatformEnum.ROCM: [
         AiterFp8BlockScaledMMKernel,
+        # RDNA2W8A8FP8LinearKernel,  # disabled: requires per-layer weight_scale
+        # which MergedColumnParallelLinear (fused QKV) lacks. Enabling it
+        # here crashes profile_run when DeepSeek-style models walk through
+        # the fused QKV path. Re-enable once the dispatcher can distinguish
+        # fused-QKV from per-projection FP8 layers.
         RDNA2W8A16Fp8BlockLinearKernel,
         TritonFp8BlockScaledMMKernel,
     ],

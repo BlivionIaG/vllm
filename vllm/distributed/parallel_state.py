@@ -501,8 +501,14 @@ class GroupCoordinator:
 
         # TODO(#35915): Remove is_tpu() check once tpu_inference
         # overrides use_custom_op_collectives() to return True.
+        # RDNA2/ROCm: custom_all_reduce.cu is CUDA-only and cannot
+        # dispatch on HIP in torch 2.12.0+rocm7.14; route through NCCL.
         self.use_custom_op_call = (
-            current_platform.is_tpu() or current_platform.use_custom_op_collectives()
+            current_platform.is_tpu()
+            or (
+                current_platform.use_custom_op_collectives()
+                and not envs.VLLM_DISABLE_CUSTOM_ALL_REDUCE
+            )
         )
 
         self.use_cpu_custom_send_recv = (

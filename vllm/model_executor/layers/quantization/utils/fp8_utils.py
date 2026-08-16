@@ -39,6 +39,17 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 
+def _is_rdna2_gfx1030() -> bool:
+    """Detect RDNA2 (gfx1030/gfx1031/gfx1032) for Wave32-specific Triton tuning."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        arch = torch.cuda.get_device_properties(0).gcnArchName
+        return arch.startswith("gfx103")
+    except Exception:
+        return False
+
+
 def is_fp8(x: torch.dtype | torch.Tensor) -> bool:
     if isinstance(x, torch.Tensor):
         x = x.dtype
@@ -825,8 +836,24 @@ def _w8a8_triton_block_scaled_mm(
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-        b = tl.load(b_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+        # gfx1030 (RDNA2): Triton 3.5.1 inserts `tt.fp_to_fp f8E4M3FN -> f?`
+        # with `rounding=rtne` while lowering `tl.dot(FP8, FP8)`, which the
+        # gfx1030 LLVM backend fails to legalize (PassManager::run failed).
+        # Casting A/B to FP16 here makes `tl.dot` an FP16×FP16→FP32 dot
+        # (lowered to V_DOT2_F32_F16 on RDNA2 — no FP8 conversion needed).
+        # Costs one FP8→FP16 cast per iteration; loses native FP8 GEMM
+        # efficiency but is necessary until Triton AMD has a working
+        # FP8→FP32 rtne lowering for gfx1030.
+        a = tl.load(
+            a_ptrs,
+            mask=offs_k[None, :] < K - k * BLOCK_SIZE_K,
+            other=0.0,
+        ).to(tl.float16)
+        b = tl.load(
+            b_ptrs,
+            mask=offs_k[:, None] < K - k * BLOCK_SIZE_K,
+            other=0.0,
+        ).to(tl.float16)
 
         k_start = k * BLOCK_SIZE_K
         offs_ks = k_start // group_k
@@ -946,14 +973,31 @@ def w8a8_triton_block_scaled_mm(
         # Default config
         # Block-wise quant: BLOCK_SIZE_N must be divisible by block_size[0]
         # BLOCK_SIZE_K must be divisible by block_size[1]
-        config = {
-            "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": block_size[0],
-            "BLOCK_SIZE_K": block_size[1],
-            "GROUP_SIZE_M": 32,
-            "num_warps": 4,
-            "num_stages": 2,
-        }
+        if _is_rdna2_gfx1030():
+            # RDNA2 (gfx1030) Wave32-friendly tuning. v81 experimental.
+            # Smaller K-block (64 vs 128) reduces register pressure on
+            # Wave32's smaller register file; num_warps=2 = 1 wave × 32
+            # threads = 32 threads per CTA (no half-wave waste on Wave32).
+            # The v80 FP16 cast fix unblocks custom FP8 path lowering, so
+            # we can now safely deviate from the CDNA default.
+            config = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": block_size[0],
+                "BLOCK_SIZE_K": 64,
+                "GROUP_SIZE_M": 32,
+                "num_warps": 2,
+                "num_stages": 2,
+            }
+        else:
+            # CDNA / NVIDIA: Wave64 or larger — original default
+            config = {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": block_size[0],
+                "BLOCK_SIZE_K": block_size[1],
+                "GROUP_SIZE_M": 32,
+                "num_warps": 4,
+                "num_stages": 2,
+            }
 
     def grid(META):
         return (

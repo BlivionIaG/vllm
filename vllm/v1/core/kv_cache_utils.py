@@ -795,7 +795,14 @@ def max_memory_usage_bytes(
     """
     Get the maximum memory usage in bytes for the given KV cache specs.
     """
-    return sum(spec.max_memory_usage_bytes(vllm_config) for spec in kv_cache_specs)
+    print("[DBGKV] max_model_len=%d" % vllm_config.model_config.max_model_len, flush=True)
+    total=0
+    for spec in kv_cache_specs:
+        m=spec.max_memory_usage_bytes(vllm_config)
+        total+=m
+        print("[DBGKV] spec=%s block=%s page=%s maxmem=%.3fGiB" % (
+            type(spec).__name__, getattr(spec,"block_size",None), getattr(spec,"page_size_bytes",None), m/1024**3), flush=True)
+    return total
 
 
 def estimate_max_model_len(

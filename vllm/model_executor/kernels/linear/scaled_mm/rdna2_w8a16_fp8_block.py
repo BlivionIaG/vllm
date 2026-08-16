@@ -21,12 +21,20 @@ back to FP16 in the kernel is wasted work. Skipping the act quant is a
 strict win on gfx1030 (same compute, half the activation bandwidth).
 """
 
+import os
+
 import torch
 
 from typing import ClassVar
 
 from vllm import _custom_ops as ops
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
+
+_DEBUG_NAN = os.environ.get("VLLM_RDNA2_MOE_DEBUG_NAN", "0") == "1"
+_DEBUG_CALLS = [0]
 
 from .BlockScaledMMLinearKernel import Fp8BlockScaledMMLinearKernel
 
@@ -185,5 +193,17 @@ class RDNA2W8A16Fp8BlockLinearKernel(Fp8BlockScaledMMLinearKernel):
         output = torch.zeros((M, N), dtype=torch.float16, device=A.device)
 
         ops.gemm_w8a16_fp8_dense(A, b_bytes, Bs, output, group_size)
+
+        if _DEBUG_NAN and _DEBUG_CALLS[0] < 4:
+            _DEBUG_CALLS[0] += 1
+            logger.warning(
+                "w8a16-fp8 call %d: A%s %s max=%.2f nan=%d | B%s | Bs%s %s "
+                "max=%.4f nan=%d | group_size=%d | out nan=%d max=%.1f",
+                _DEBUG_CALLS[0], tuple(A.shape), A.dtype,
+                A.float().abs().max().item(), torch.isnan(A).sum().item(),
+                tuple(B.shape), tuple(Bs.shape), Bs.dtype,
+                Bs.float().abs().max().item(), torch.isnan(Bs).sum().item(),
+                group_size, torch.isnan(output).sum().item(),
+                output.float().abs().max().item())
 
         return output

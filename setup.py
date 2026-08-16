@@ -309,8 +309,13 @@ class cmake_build_ext(build_ext):
         # Make sure we use the nvcc from CUDA_HOME
         if _is_cuda() and CUDA_HOME is not None:
             cmake_args += [f"-DCMAKE_CUDA_COMPILER={CUDA_HOME}/bin/nvcc"]
-        elif _is_hip() and ROCM_HOME is not None:
-            cmake_args += [f"-DROCM_PATH={ROCM_HOME}"]
+        elif _is_hip():
+            # gfx1030: torch's auto-detected ROCM_HOME may be the wrong ROCm
+            # install (torch was built against a different ROCm version).
+            # Honor ROCM_PATH env var first to avoid this.
+            rocm_path = os.environ.get("ROCM_PATH") or ROCM_HOME
+            if rocm_path is not None:
+                cmake_args += [f"-DROCM_PATH={rocm_path}"]
 
         other_cmake_args = os.environ.get("CMAKE_ARGS")
         if other_cmake_args:

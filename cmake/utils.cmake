@@ -5,7 +5,14 @@
 macro (find_python_from_executable EXECUTABLE SUPPORTED_VERSIONS)
   file(REAL_PATH ${EXECUTABLE} EXECUTABLE)
   set(Python_EXECUTABLE ${EXECUTABLE})
-  find_package(Python COMPONENTS Interpreter Development.Module Development.SABIModule)
+  # RDNA2/venv-7.14.0 build: venv Python sysconfig points at /usr/include
+  # (system python3.12-devel provides it) but cmake's old find_package(Python)
+  # doesn't read sysconfig in time. Use the PYTHON_* hint variables.
+  set(PYTHON_INCLUDE_DIRS /usr/include/python3.12
+      CACHE PATH "Python include dirs" FORCE)
+  set(PYTHON_LIBRARY /usr/lib64/libpython3.12.so
+      CACHE FILEPATH "Python library" FORCE)
+  find_package(Python COMPONENTS Interpreter Development Development.SABIModule)
   if (NOT Python_FOUND)
     message(FATAL_ERROR "Unable to find python matching: ${EXECUTABLE}.")
   endif()

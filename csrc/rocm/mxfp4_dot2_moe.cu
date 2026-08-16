@@ -146,17 +146,21 @@ __global__ void moe_gemm_mxfp4_kernel_rdna2(
   int k = offset_k;
   while (k < end_k) {
     // Load 4 scale bytes for the 4 N columns handled by this thread.
-    // Convert each to fp16 and pack into 2 half2s that broadcast across
-    // j-iterations (each scale applies to all 8 K elements of one weight
-    // word, but the scale is per-32-block so it applies to the full iter).
+    // Convert each to fp16 and broadcast into per-column half2s reused
+    // across j-iterations (each scale applies to all 8 K elements of one
+    // weight word; the scale is per-32-block so it applies to the full iter).
     half s0 = vllm::mxfp4_dot2::ue8m0_to_fp16(s_ptr[0]);
     half s1 = vllm::mxfp4_dot2::ue8m0_to_fp16(s_ptr[1]);
     half s2 = vllm::mxfp4_dot2::ue8m0_to_fp16(s_ptr[2]);
     half s3 = vllm::mxfp4_dot2::ue8m0_to_fp16(s_ptr[3]);
-    // scale01 covers N columns [n+0, n+1], scale23 covers [n+2, n+3]
-    half2 scale01 = __halves2half2(s0, s1);
-    half2 scale23 = __halves2half2(s2, s3);
-    s_ptr += 4 * size_n;  // advance 4 N columns' worth of scales
+    // Each int32 weight word holds 8 consecutive K nibbles of ONE N column,
+    // and dequant_e2m1_8_fp16 multiplies half2 lanes elementwise, so each
+    // column's scale must be broadcast to both lanes.
+    half2 scale0 = __halves2half2(s0, s0);
+    half2 scale1 = __halves2half2(s1, s1);
+    half2 scale2b = __halves2half2(s2, s2);
+    half2 scale3 = __halves2half2(s3, s3);
+    s_ptr += size_n;  // one scale row per 32-K iteration
 
     // Prefetch 4 weight words (128 bytes)
     int4 b_w[4];
@@ -172,8 +176,8 @@ __global__ void moe_gemm_mxfp4_kernel_rdna2(
 
       // fp16 path: E2M1 LUT dequant, dot via v_dot2_f32_f16
       half2 dq[4];
-      vllm::mxfp4_dot2::dequant_e2m1_8_fp16((uint32_t)b_w[j].x, scale01, dq);
-      // dq holds 4 half2 pairs (8 fp16 values) for column pair (n+0, n+1)
+      vllm::mxfp4_dot2::dequant_e2m1_8_fp16((uint32_t)b_w[j].x, scale0, dq);
+      // dq holds 4 half2 pairs (8 fp16 values) for column n+0
       // We re-use them across 4 m rows below.
 #pragma unroll
       for (int m = 0; m < BLOCK_SIZE_M; ++m) {
@@ -183,7 +187,7 @@ __global__ void moe_gemm_mxfp4_kernel_rdna2(
       }
 
       half2 dq2[4];
-      vllm::mxfp4_dot2::dequant_e2m1_8_fp16((uint32_t)b_w[j].y, scale01, dq2);
+      vllm::mxfp4_dot2::dequant_e2m1_8_fp16((uint32_t)b_w[j].y, scale1, dq2);
 #pragma unroll
       for (int m = 0; m < BLOCK_SIZE_M; ++m) {
         const half* a_ptr =
@@ -192,7 +196,7 @@ __global__ void moe_gemm_mxfp4_kernel_rdna2(
       }
 
       half2 dq3[4];
-      vllm::mxfp4_dot2::dequant_e2m1_8_fp16((uint32_t)b_w[j].z, scale23, dq3);
+      vllm::mxfp4_dot2::dequant_e2m1_8_fp16((uint32_t)b_w[j].z, scale2b, dq3);
 #pragma unroll
       for (int m = 0; m < BLOCK_SIZE_M; ++m) {
         const half* a_ptr =
@@ -201,7 +205,7 @@ __global__ void moe_gemm_mxfp4_kernel_rdna2(
       }
 
       half2 dq4[4];
-      vllm::mxfp4_dot2::dequant_e2m1_8_fp16((uint32_t)b_w[j].w, scale23, dq4);
+      vllm::mxfp4_dot2::dequant_e2m1_8_fp16((uint32_t)b_w[j].w, scale3, dq4);
 #pragma unroll
       for (int m = 0; m < BLOCK_SIZE_M; ++m) {
         const half* a_ptr =
@@ -399,7 +403,10 @@ void moe_mxfp4_gemm_rdna2(
   // [E, K/2, N] uint8. Both forms point at the same first byte. Treat it
   // as uint8 storage for the data_ptr cast — the kernel reads it as
   // uint32 (which is byte-equivalent on a little-endian GPU).
-  const uint8_t* b_qw_bytes = b_q_weight.data_ptr<uint8_t>();
+  // Use untyped data_ptr() — the typed data_ptr<uint8_t>() would throw
+  // "expected scalar type Byte" when the caller passes a uint32 view.
+  const uint8_t* b_qw_bytes =
+      static_cast<const uint8_t*>(b_q_weight.data_ptr());
 
   if (a.scalar_type() == torch::kHalf) {
     dispatch_moe_gemm_mxfp4<half>(
