@@ -320,11 +320,15 @@ def _dequantize_and_gather_k_kernel(
                 exponent = encoded_scale.to(tl.float32) - 127.0
                 scale = tl.exp2(exponent)
 
-                # Dequantize: bf16_value = fp8_value * scale
+                # Dequantize: value = fp8_value * scale
                 x_dequant = x_float * scale
 
-                # Store as bf16
-                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
+                # Store in the output's dtype: bf16 on CDNA, fp16 on gfx10x.
+                tl.store(
+                    output_row_ptr + offsets,
+                    x_dequant.to(out_ptr.dtype.element_ty),
+                    mask=mask,
+                )
 
         # ========== Copy BF16 portion directly ==========
         bf16_output_offset = fp8_dim  # After 448 elements in output
@@ -336,7 +340,10 @@ def _dequantize_and_gather_k_kernel(
         for j in tl.static_range(bf16_dim // 16):
             chunk_offsets = j * 16 + tl.arange(0, 16)
             bf16_vals = tl.load(bf16_cache_ptr + chunk_offsets)
-            tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
+            tl.store(
+                output_row_ptr + bf16_output_offset + chunk_offsets,
+                bf16_vals.to(out_ptr.dtype.element_ty),
+            )
 
 
 def dequantize_and_gather_k_cache_triton(

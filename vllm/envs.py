@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
+    VLLM_DISABLE_CUSTOM_ALL_REDUCE: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
@@ -146,6 +147,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
+    VLLM_USE_RDNA2_FA: bool = True
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -1157,6 +1159,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so that vLLM can verify if p2p is actually working.
     # See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa
     "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
+    # Force collectives through NCCL/torch.distributed, bypassing
+    # torch.ops.vllm.all_reduce. Required on ROCm: custom_all_reduce.cu
+    # is CUDA-only and cannot dispatch on HIP.
+    "VLLM_DISABLE_CUSTOM_ALL_REDUCE": lambda: (
+        os.getenv("VLLM_DISABLE_CUSTOM_ALL_REDUCE", "False").lower()
+        in ("true", "1")
+    ),
     # List of quantization kernels that should be disabled, used for testing
     # and performance comparisons. Currently only affects MPLinearKernel
     # selection
@@ -1290,6 +1299,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
+    ),
+    # FA-RDNA2: opt-out switch for the Flash-Attention v2 hand-port that
+    # intercepts inside RocmAttentionImpl.forward() on gfx1030. Off-by-default
+    # here so users explicitly enable it; the rdna_fork flips this to True.
+    "VLLM_USE_RDNA2_FA": lambda: (
+        os.getenv("VLLM_USE_RDNA2_FA", "False").lower() in ("true", "1")
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE

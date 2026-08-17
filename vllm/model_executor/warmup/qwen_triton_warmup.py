@@ -21,6 +21,7 @@ _QWEN_MODEL_TYPES = frozenset(
         "qwen3_5_text",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
+        "deepseek_v4",
     }
 )
 

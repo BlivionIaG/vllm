@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -18,6 +20,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx10x
 from vllm.triton_utils import tl, triton
 from vllm.utils.deep_gemm import (
     fp8_fp4_mqa_logits,
@@ -867,7 +870,132 @@ class SparseAttnIndexer(CustomOp):
                 self.topk_indices_buffer,
                 skip_k_cache_insert=self.skip_k_cache_insert,
             )
+        if on_gfx10x():
+            return self._forward_hip_rdna2(
+                hidden_states, q_quant, k, weights,
+            )
         raise RuntimeError(
             "Sparse attention indexer ROCm path is only supported on AITER. "
             "Please enable aiter with VLLM_ROCM_USE_AITER=1"
         )
+
+    def _forward_hip_rdna2(
+        self,
+        hidden_states: torch.Tensor,
+        q_fp8: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        # AITER is CDNA-only and crashes on gfx1030. This path uses our
+        # local `paged_mqa_logits_decode_rdna2` HIP kernel for the MQA
+        # logits and `top_k_per_row_decode` (radix-select) for top-K.
+        from vllm.forward_context import get_forward_context
+        from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+            indexer_k_quant_and_cache_triton,
+        )
+
+        attn_metadata = get_forward_context().attn_metadata
+        if not isinstance(attn_metadata, dict):
+            return self.topk_indices_buffer
+
+        layer_meta = attn_metadata[self.k_cache.prefix]
+        assert isinstance(layer_meta, DeepseekV32IndexerMetadata)
+        slot_mapping = layer_meta.slot_mapping
+        num_tokens = slot_mapping.shape[0]
+        if k is not None:
+            k = k[:num_tokens]
+        assert self.skip_k_cache_insert or k is not None
+        if not self.skip_k_cache_insert:
+            indexer_k_quant_and_cache_triton(
+                k,
+                self.k_cache.kv_cache,
+                slot_mapping,
+                self.quant_block_size,
+                self.scale_fmt,
+            )
+
+        self.topk_indices_buffer[: hidden_states.shape[0]] = -1
+        if layer_meta.num_decodes > 0:
+            return self._rdna2_indexer_decode(
+                hidden_states, q_fp8, weights, layer_meta,
+            )
+        return self.topk_indices_buffer
+
+    def _rdna2_indexer_decode(
+        self,
+        hidden_states: torch.Tensor,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        layer_meta: DeepseekV32IndexerMetadata,
+    ) -> torch.Tensor:
+        decode_meta = layer_meta.decode
+        assert decode_meta is not None
+        num_decode_tokens = layer_meta.num_decode_tokens
+        decode_lens = decode_meta.decode_lens
+        if decode_meta.requires_padding:
+            padded_q = pack_seq_triton(
+                q_fp8[:num_decode_tokens], decode_lens,
+            )
+        else:
+            padded_q = q_fp8[:num_decode_tokens].reshape(
+                decode_meta.seq_lens.shape[0], -1, *q_fp8.shape[1:]
+            )
+        batch_size, next_n = padded_q.shape[:2]
+        kv_cache_view = self.k_cache.kv_cache.unsqueeze(-2)
+        seq_lens = decode_meta.seq_lens
+        seq_lens_1d = (
+            seq_lens[:, -1].contiguous() if seq_lens.dim() > 1
+            else seq_lens.contiguous()
+        )
+        if os.environ.get("VLLM_PAGED_MQA_DEBUG_OOB") == "1":
+            import logging
+            logging.getLogger(__name__).warning(
+                "[MQA_DBG] q_fp8=%s padded_q=%s weights=%s seq_lens_1d=%s vals=%s "
+                "block_table=%s btmax=%d btmin=%d kv=%s kvs0=%d kvs1=%d bs=%d "
+                "num_pages=%d max_model_len=%d next_n=%d decode_tokens=%d",
+                tuple(q_fp8.shape), tuple(padded_q.shape),
+                tuple(weights.shape), tuple(seq_lens_1d.shape),
+                seq_lens_1d.tolist(),
+                tuple(decode_meta.block_table.shape),
+                int(decode_meta.block_table.max().item()),
+                int(decode_meta.block_table.min().item()),
+                tuple(kv_cache_view.shape), kv_cache_view.stride(0),
+                kv_cache_view.stride(1), kv_cache_view.shape[1],
+                int(kv_cache_view.shape[0]), self.max_model_len,
+                next_n, num_decode_tokens,
+            )
+        logits = torch.ops._rocm_C.paged_mqa_logits_decode_rdna2(
+            padded_q.view(torch.uint8),
+            kv_cache_view,
+            weights[: batch_size * next_n],
+            seq_lens_1d,
+            decode_meta.block_table,
+            self.max_model_len,
+        )
+        num_rows = logits.shape[0]
+        topk_view = self.topk_indices_buffer[
+            : num_rows, : self.topk_tokens
+        ]
+        # Radix-select top-k per row (the same kernel upstream uses), instead
+        # of a full torch.topk sort per row. Reads logits[0, rowEnd) where
+        # rowEnd is derived from seq_lens, so the -inf-padded columns past
+        # each row's context length are never touched.
+        ops.top_k_per_row_decode(
+            logits,
+            next_n,
+            seq_lens,
+            topk_view,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            self.topk_tokens,
+        )
+        if decode_meta.requires_padding:
+            unpacked = unpack_seq_triton(
+                topk_view.view(batch_size, next_n, -1),
+                decode_lens,
+            )
+            self.topk_indices_buffer[:num_decode_tokens, : unpacked.shape[-1]] = (
+                unpacked
+            )
+        return self.topk_indices_buffer

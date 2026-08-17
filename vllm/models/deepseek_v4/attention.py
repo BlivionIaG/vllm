@@ -8,12 +8,17 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
 
 import vllm.envs as envs
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -368,6 +373,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         qr_kv, kv_score, indexer_kv_score, indexer_weights = (
             self.attn_gemm_parallel_execute(hidden_states)
         )
+        _dbg = os.environ.get("VLLM_RDNA2_MOE_DEBUG_NAN", "0") == "1"
+        if _dbg:
+
+            def _nan(t) -> int:
+                return torch.isnan(t).sum().item() if isinstance(t, torch.Tensor) else -1
+
+            logger.warning(
+                "attn %s qr_kv: nan=%d max=%.1f | kv_score: nan=%d | idx_w: nan=%d",
+                self.prefix, _nan(qr_kv),
+                qr_kv.float().abs().max().item(),
+                _nan(kv_score), _nan(indexer_weights))
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         qr, kv = fused_q_kv_rmsnorm(
             qr,
@@ -376,6 +392,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             self.kv_norm.weight.data,
             self.eps,
         )
+        if _dbg:
+            logger.warning(
+                "attn %s post-norm qr: nan=%d max=%.2f | kv: nan=%d max=%.2f",
+                self.prefix, _nan(qr), qr.float().abs().max().item(),
+                _nan(kv), kv.float().abs().max().item())
 
         # attention_impl is wrapped with @eager_break_during_capture: this is
         # where the breakable cudagraph capture breaks (the attention op runs
@@ -391,6 +412,10 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             o_padded,
         )
         o = o_padded[:, : self.n_local_heads, :]
+        if _dbg:
+            logger.warning(
+                "attn %s core-out o: nan=%d max=%.2f",
+                self.prefix, _nan(o), o.float().abs().max().item())
 
         # Inverse-RoPE + wo_a + wo_b output projection (platform-specific).
         return self._o_proj(o, positions)
@@ -535,9 +560,21 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
             q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
+        if os.environ.get("VLLM_RDNA2_MOE_DEBUG_NAN", "0") == "1":
+            logger.warning(
+                "attn %s pre-mqa q: nan=%d max=%.2f",
+                self.prefix,
+                torch.isnan(q).sum().item(), q.float().abs().max().item())
+
         # MLA attention writes into the pre-allocated `out` buffer
         # ([num_tokens, padded_heads, head_dim]).
         self.forward_mqa(q, kv, positions, out)
+
+        if os.environ.get("VLLM_RDNA2_MOE_DEBUG_NAN", "0") == "1":
+            logger.warning(
+                "attn %s post-mqa out: nan=%d max=%.2f",
+                self.prefix,
+                torch.isnan(out).sum().item(), out.float().abs().max().item())
 
     def _fused_qnorm_rope_kv_insert(
         self,

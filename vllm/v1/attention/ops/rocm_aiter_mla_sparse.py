@@ -1817,6 +1817,9 @@ def _rocm_sparse_attn_prefill_ragged_triton(
     assert indptr.ndim == 1, f"expected indptr=[sq+1], got {indptr.shape}"
     assert not q.is_cpu and not kv.is_cpu and not indices.is_cpu and not indptr.is_cpu
 
+    if kv.dtype != q.dtype:
+        kv = kv.to(q.dtype)
+
     indices = _as_int32_contiguous_1d(indices)
     indptr = _as_int32_contiguous_1d(indptr)
     has_attn_sink = attn_sink is not None
@@ -2073,7 +2076,13 @@ def _rocm_sparse_attn_decode_ragged_triton(
     is_fnuz = current_platform.is_fp8_fnuz()
 
     if not (_ON_GFX942 or _ON_GFX950):  # Fallback path for un-tuned architectures.
-        block_k = 16 if head_dim >= 256 else 32
+        from vllm.platforms.rocm import on_gfx10x
+        # gfx1030 Wave32 benefits from larger BLOCK_K. 32k-context
+        # decode iterations drop from 1k to 0.5k for BLOCK_K=64.
+        if on_gfx10x() and head_dim < 256:
+            block_k = 64
+        else:
+            block_k = 16 if head_dim >= 256 else 32
         _sparse_attn_decode_ragged_kernel[(num_queries, heads_blocks)](
             q,
             main_cache,
@@ -2274,6 +2283,12 @@ def rocm_sparse_attn_prefill(
         rope_head_dim,
         "rocm_sparse_attn_prefill",
     )
+    # gfx1030 Triton kernels hardcode bf16 for k_nope/k_rope; the model
+    # dtype is fp16 on RDNA so we cast q to match. Skip on CDNA where
+    # the AITER path is used and q is already bf16.
+    from vllm.platforms.rocm import on_gfx10x
+    if on_gfx10x() and q.dtype != torch.bfloat16:
+        q = q.to(torch.bfloat16)
     if ragged_indices is not None and ragged_indptr is not None:
         output_chunk = _rocm_sparse_attn_prefill_ragged_triton(
             q=q,
@@ -2330,6 +2345,12 @@ def rocm_sparse_attn_decode(
         rope_head_dim,
         "rocm_sparse_attn_decode",
     )
+    # gfx1030 Triton kernels hardcode bf16 for k_nope/k_rope; the model
+    # dtype is fp16 on RDNA so we cast q to match. Skip on CDNA where
+    # the AITER path is used and q is already bf16.
+    from vllm.platforms.rocm import on_gfx10x
+    if on_gfx10x() and q.dtype != torch.bfloat16:
+        q = q.to(torch.bfloat16)
 
     main_indices = swa_indices.reshape(swa_indices.shape[0], -1)
 

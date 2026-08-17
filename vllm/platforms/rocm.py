@@ -204,6 +204,7 @@ def _get_gcn_arch() -> str:
 _GCN_ARCH = _get_gcn_arch()
 
 _ON_GFX1X = any(arch in _GCN_ARCH for arch in ["gfx11", "gfx12"])
+_ON_GFX10X = any(arch in _GCN_ARCH for arch in ["gfx10"])
 _ON_GFX11 = "gfx11" in _GCN_ARCH
 _ON_GFX1100 = "gfx1100" in _GCN_ARCH
 _ON_GFX1151 = "gfx1151" in _GCN_ARCH
@@ -293,6 +294,10 @@ def _capability_from_gcn_arch(gcn_arch: str) -> tuple[int, int] | None:
 
 def on_gfx1x() -> bool:
     return _ON_GFX1X and not _ON_CDNA
+
+
+def on_gfx10x() -> bool:
+    return _ON_GFX10X
 
 
 def on_gfx11() -> bool:
@@ -392,8 +397,10 @@ def use_rocm_custom_paged_attention(
         )
 
     else:
+        if os.environ.get("VLLM_USE_RDNA2_FA") != "1":
+            return False
         return (
-            _ON_GFX1X
+            (_ON_GFX10X or _ON_GFX1X)
             and (sliding_window == 0 or sliding_window == (-1, -1))
             and (qtype == torch.half or qtype == torch.bfloat16)
             and head_size == 128
@@ -770,7 +777,11 @@ class RocmPlatform(Platform):
     @lru_cache(maxsize=8)
     def get_device_name(cls, device_id: int = 0) -> str:
         physical_device_id = cls.device_id_to_physical_device_id(device_id)
-        handle = amdsmi_get_processor_handles()[physical_device_id]
+        try:
+            handle = amdsmi_get_processor_handles()[physical_device_id]
+        except IndexError:
+            # GPU assignment quirk: worker may bind outside visible range.
+            return f"RDNA2_gpu_{physical_device_id}"
         asic_info = amdsmi_get_gpu_asic_info(handle)
         asic_info_device_id: str = asic_info["device_id"]
         if asic_info_device_id in _ROCM_DEVICE_ID_NAME_MAP:

@@ -1455,6 +1455,23 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     list(APPEND VLLM_ROCM_EXT_FLAGS "-DVLLM_SKIP_SKINNY_GEMMS")
   endif()
 
+  set(VLLM_ROCM_HAS_GFX1030 OFF)
+  if(VLLM_GPU_ARCHES MATCHES "gfx1030")
+    set(VLLM_ROCM_HAS_GFX1030 ON)
+    list(APPEND VLLM_ROCM_EXT_SRC
+      "csrc/rocm/q_gemm_rdna2.cu"
+      "csrc/rocm/q_gemm_rdna2_prefill.cu"
+      "csrc/rocm/fa_rdna2.cu"
+      "csrc/rocm/q_gemm_w8a16_fp8_rdna2.cu"
+      "csrc/rocm/gemm_w8a8_fp8_dense_rdna2.cu"
+      "csrc/rocm/moe_q_gemm_rdna2.cu"
+      "csrc/rocm/moe_w8a16_rdna2.cu"
+      "csrc/rocm/mxfp4_dot2_moe.cu"
+      "csrc/rocm/mxfp4_dot2_dense.cu"
+      "csrc/rocm/indexer_paged_mqa_rdna2.cu"
+      "csrc/rocm/sparse_mla_rdna2.cu")
+  endif()
+
   set(VLLM_ROCM_HAS_GFX1100 OFF)
   if(VLLM_GPU_ARCHES MATCHES "gfx1100")
     set(VLLM_ROCM_HAS_GFX1100 ON)
@@ -1480,9 +1497,23 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
     target_compile_definitions(_rocm_C PRIVATE VLLM_SKIP_SKINNY_GEMMS)
   endif()
 
+  if(VLLM_ROCM_HAS_GFX1030)
+    target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_GFX1030)
+  endif()
   if(VLLM_ROCM_HAS_GFX1100)
     target_compile_definitions(_rocm_C PRIVATE VLLM_ROCM_GFX1100)
   endif()
+  # torch 2.13 + ROCm 7.2 shim: cusolver was renamed to hipsolver.
+  # Provide cusolver_common.h shim + hipsolver include path globally.
+  if(DEFINED ENV{ROCM_PATH})
+    target_include_directories(_rocm_C SYSTEM PRIVATE $ENV{ROCM_PATH}/include)
+  endif()
+  if(EXISTS "$ENV{ROCM_PATH}/include/cusolver_common.h")
+    target_compile_options(_rocm_C PRIVATE -include $ENV{ROCM_PATH}/include/cusolver_common.h)
+  endif()
+  # GCC 15 + torch 2.13 + ROCm 7.2 namespace parser workaround
+  # (qdq_4_rdna2.cuh:22 false-positive on namespace vllm {)
+  target_compile_options(_rocm_C PRIVATE -fpermissive)
 endif()
 
 # Must run after the last HIP `define_extension_target` so every extension

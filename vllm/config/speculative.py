@@ -330,7 +330,13 @@ class SpeculativeConfig:
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
+        import os
         initial_architecture = hf_config.architectures[0]
+        # gfx1030: model config has num_nextn_predict_layers=1 which auto-
+        # enables DSpark MTP. Set VLLM_DISABLE_DSPARK_MTP=1 to skip for
+        # clean greedy-decode benchmarks.
+        if os.environ.get("VLLM_DISABLE_DSPARK_MTP") == "1":
+            return hf_config
         if hf_config.model_type in (
             "deepseek_v3",
             "deepseek_v32",

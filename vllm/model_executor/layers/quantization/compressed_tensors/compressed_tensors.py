@@ -839,7 +839,9 @@ class CompressedTensorsConfig(QuantizationConfig):
 
             # note: input_quant can be None
             if self._is_fp8_w8a16(weight_quant, input_quant):
-                is_static_input_scheme = input_quant and not input_quant.dynamic
+                is_static_input_scheme = (
+                    input_quant is not None and not input_quant.dynamic
+                )
                 return CompressedTensorsW8A16Fp8(
                     weight_quant=weight_quant,
                     is_static_input_scheme=is_static_input_scheme,

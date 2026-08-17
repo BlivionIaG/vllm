@@ -116,6 +116,7 @@ class Mxfp4MoeBackend(Enum):
     # Triton
     TRITON = "TRITON"
     TRITON_UNFUSED = "TRITON_UNFUSED"
+    MXF4_RDNA2 = "MXF4_RDNA2"
     # XPU
     XPU = "XPU"
     # CPU
@@ -188,11 +189,25 @@ def backend_to_kernel_cls(
         return [OAITritonMxfp4ExpertsMonolithic, OAITritonExperts]
 
     elif backend == Mxfp4MoeBackend.TRITON_UNFUSED:
-        from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (  # noqa: E501
+        from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (
             UnfusedOAITritonExperts,
         )
 
         return [UnfusedOAITritonExperts]
+
+    elif backend == Mxfp4MoeBackend.MXF4_RDNA2:
+        from vllm.model_executor.layers.fused_moe.experts.rdna2_mxfp4_moe import (
+            RDNA2Mxfp4MoEExperts,
+        )
+
+        return [RDNA2Mxfp4MoEExperts]
+
+    elif backend == Mxfp4MoeBackend.MXF4_RDNA2:
+        from vllm.model_executor.layers.fused_moe.experts.rdna2_mxfp4_moe import (
+            RDNA2Mxfp4MoEExperts,
+        )
+
+        return [RDNA2Mxfp4MoEExperts]
 
     elif backend == Mxfp4MoeBackend.HUMMING:
         from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
@@ -609,6 +624,7 @@ def select_deepseek_v4_mxfp4_moe_backend(
         and config.routing_method == RoutingMethodType.DeepseekV4
     ):
         priority_backends = [
+            Mxfp4MoeBackend.MXF4_RDNA2,
             Mxfp4MoeBackend.AITER_MXFP4_BF16,
             Mxfp4MoeBackend.TRITON_UNFUSED,
         ]
@@ -1576,6 +1592,27 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w13_bias,
             w2_bias,
         )
+    elif mxfp4_backend == Mxfp4MoeBackend.MXF4_RDNA2:
+        # Checkpoint layout [E, N, K/2] uint8 (2 E2M1/byte, lo nibble first)
+        # -> kernel layout [E, K/8, N] int32 (8 E2M1 LSB-first per word).
+        # A little-endian int32 view preserves nibble order exactly.
+        w13_weight = (
+            w13_weight.contiguous().view(torch.int32).permute(0, 2, 1).contiguous()
+        )
+        w2_weight = (
+            w2_weight.contiguous().view(torch.int32).permute(0, 2, 1).contiguous()
+        )
+        # Scales: [E, N, K/32] uint8 -> [E, K/32, N].
+        w13_weight_scale = w13_weight_scale.permute(0, 2, 1).contiguous()
+        w2_weight_scale = w2_weight_scale.permute(0, 2, 1).contiguous()
+        return (
+            w13_weight,
+            w2_weight,
+            w13_weight_scale,
+            w2_weight_scale,
+            w13_bias,
+            w2_bias,
+        )
     else:
         raise ValueError(
             f"Unsupported mxfp4_backend for Mxfp4MoEMethod: {mxfp4_backend}. "
@@ -1752,6 +1789,10 @@ def make_mxfp4_moe_kernel(
             quant_config=moe_quant_config,
             **extra_kwargs,
         )
+
+    if mxfp4_backend == Mxfp4MoeBackend.MXF4_RDNA2:
+        assert layer is not None
+        experts._layer_ref = layer
 
     kernel = mk.FusedMoEKernel(
         prepare_finalize,

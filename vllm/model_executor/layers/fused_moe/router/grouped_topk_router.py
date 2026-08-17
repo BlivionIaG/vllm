@@ -64,6 +64,18 @@ def fused_grouped_topk(
             e_score_correction_bias,
             0,  # scoring_func=0 (no activation, scores already computed)
         )
+    elif scoring_func == "sqrtsoftplus":
+        scores = torch.nn.functional.softplus(gating_output).sqrt()
+        topk_values, topk_indices = ops.grouped_topk(
+            scores,
+            num_expert_group,
+            topk_group,
+            topk,
+            renormalize,
+            routed_scaling_factor,
+            e_score_correction_bias,
+            0,
+        )
     else:
         raise ValueError(f"Unsupported scoring function: {scoring_func}")
 
@@ -113,6 +125,8 @@ def grouped_topk(
         scores = torch.softmax(gating_output, dim=-1)
     elif scoring_func == "sigmoid":
         scores = gating_output.sigmoid()
+    elif scoring_func == "sqrtsoftplus":
+        scores = torch.nn.functional.softplus(gating_output).sqrt()
     else:
         raise ValueError(f"Unsupported scoring function: {scoring_func}")
 

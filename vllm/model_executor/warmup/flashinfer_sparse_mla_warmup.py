@@ -253,3 +253,15 @@ def deepseek_v4_sparse_mla_attention_warmup(worker: "Worker") -> None:
                 force_attention=True,
                 create_mixed_batch=True,
             )
+            # Cover the pure-decode-shapes (next_n=1) so the first
+            # real inference doesn't trigger JIT compilation on the
+            # hot path. Without this, _compute_slot_mapping_kernel,
+            # _build_c128a_topk_metadata_kernel, etc. fire during
+            # the first decode step.
+            runner._dummy_run(
+                num_tokens=1,
+                skip_eplb=True,
+                is_profile=True,
+                force_attention=True,
+                create_mixed_batch=False,
+            )

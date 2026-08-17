@@ -26,6 +26,12 @@ from vllm.model_executor.kernels.linear.scaled_mm.pytorch import (
     PerTensorTorchFP8ScaledMMLinearKernel,
     RowWiseTorchFP8ScaledMMLinearKernel,
 )
+from vllm.model_executor.kernels.linear.scaled_mm.rdna2_w8a16_fp8_block import (
+    RDNA2W8A16Fp8BlockLinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.rdna2_w8a8_fp8 import (
+    RDNA2W8A8FP8LinearKernel,
+)
 from vllm.model_executor.kernels.linear.scaled_mm.rocm import (
     ROCmFP8ScaledMMLinearKernel,
 )
@@ -63,6 +69,8 @@ __all__ = [
     "PerTensorTorchFP8ScaledMMLinearKernel",
     "RowWiseTorchFP8ScaledMMLinearKernel",
     "ROCmFP8ScaledMMLinearKernel",
+    "RDNA2W8A8FP8LinearKernel",
+    "RDNA2W8A16Fp8BlockLinearKernel",
     "TritonInt8ScaledMMLinearKernel",
     "ZentorchInt8ScaledMMLinearKernel",
     "Fp8BlockScaledMMLinearKernel",

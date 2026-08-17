@@ -353,24 +353,30 @@ __device__ __forceinline__ void processDeepseekV4Slot(
           token_scale_ptr[kNumQuantBlocks] = 0;
         }
       } else {
+        // The fp8_ds_mla format specifies the RoPE section as bf16
+        // regardless of model dtype; readers decode it as bf16. Convert via
+        // the bf16 converter even when scalar_t_in is Half (fp16 models).
+        using RopeConverter =
+            vllm::_typeConvert<torch::headeronly::BFloat16>;
         uint4 out0, out1;
-        typename Converter::packed_hip_type* po0 =
-            reinterpret_cast<typename Converter::packed_hip_type*>(&out0);
-        typename Converter::packed_hip_type* po1 =
-            reinterpret_cast<typename Converter::packed_hip_type*>(&out1);
+        typename RopeConverter::packed_hip_type* po0 =
+            reinterpret_cast<typename RopeConverter::packed_hip_type*>(&out0);
+        typename RopeConverter::packed_hip_type* po1 =
+            reinterpret_cast<typename RopeConverter::packed_hip_type*>(&out1);
 #pragma unroll
         for (int i = 0; i < 4; i++) {
-          po0[i] = Converter::convert(
+          po0[i] = RopeConverter::convert(
               make_float2(elements[2 * i], elements[2 * i + 1]));
         }
 #pragma unroll
         for (int i = 0; i < 4; i++) {
-          po1[i] = Converter::convert(
+          po1[i] = RopeConverter::convert(
               make_float2(elements[8 + 2 * i], elements[8 + 2 * i + 1]));
         }
         int const rope_local_base = dim_base - kNopeDim;
-        scalar_t_in* bf16_dst =
-            reinterpret_cast<scalar_t_in*>(token_bf16_ptr) + rope_local_base;
+        RopeConverter::hip_type* bf16_dst =
+            reinterpret_cast<RopeConverter::hip_type*>(token_bf16_ptr) +
+            rope_local_base;
         *reinterpret_cast<uint4*>(bf16_dst) = out0;
         *reinterpret_cast<uint4*>(bf16_dst + 8) = out1;
       }
