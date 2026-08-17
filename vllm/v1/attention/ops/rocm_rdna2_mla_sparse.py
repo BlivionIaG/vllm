@@ -615,8 +615,9 @@ def _hip_sparse_attn_decode(
 ) -> None:
     logger.info_once(
         "RDNA2 sparse MLA decode using HIP kernel sparse_mla_decode_rdna2")
-    if q.dtype != torch.bfloat16:
-        q = q.to(torch.bfloat16)
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"RDNA2 HIP sparse MLA decode expects fp16 or bf16 q, got {q.dtype}")
     B, H, D = q.shape
     main_block_size = swa_k_cache.size(1)
     main_num_rows = swa_k_cache.size(0) * main_block_size
@@ -641,7 +642,7 @@ def _hip_sparse_attn_decode(
     else:
         sink = attn_sink[:H].to(torch.float32).contiguous()
 
-    out = torch.empty(B, H, D, device=q.device, dtype=torch.bfloat16)
+    out = torch.empty(B, H, D, device=q.device, dtype=q.dtype)
     torch.ops._rocm_C.sparse_mla_decode_rdna2(
         q,
         swa_k_cache,
@@ -658,7 +659,7 @@ def _hip_sparse_attn_decode(
         sink,
         out,
     )
-    output.copy_(out.to(output.dtype))
+    output.copy_(out)
 
 
 def rocm_rdna2_sparse_attn_decode(

@@ -186,7 +186,7 @@ torch::Tensor paged_mqa_logits_decode_rdna2(
 // FP8 (E4M3 OCP) K_nope with E8M0 block scales, bf16 K_rope. Gated
 // by VLLM_USE_RDNA2_MLA=1 and on_gfx10x().
 void sparse_mla_decode_rdna2(
-    torch::Tensor q,                  // [B, H, D] bf16
+    torch::Tensor q,                  // [B, H, D] fp16 or bf16
     torch::Tensor main_cache,         // [num_blocks, block_size, 576] uint8
     torch::Tensor main_indices,       // [nnz] int32
     torch::Tensor main_indptr,        // [B+1] int32

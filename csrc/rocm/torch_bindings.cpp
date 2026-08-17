@@ -179,8 +179,8 @@ TORCH_LIBRARY(_rocm_C, rocm_ops) {
   // path is CDNA-only and does not run on gfx1030). 1 CTA per query,
   // 32 threads (wave32), 2 heads per thread; online softmax with
   // full acc_nope/acc_rope state in registers. FP8 (E4M3 OCP) K_nope
-  // with E8M0 block scales, bf16 K_rope. Gated by
-  // VLLM_USE_RDNA2_MLA=1 and on_gfx10x().
+  // with E8M0 block scales, bf16 K_rope. q/out may be fp16 (gfx1030)
+  // or bf16 (RDNA3+). Gated by VLLM_USE_RDNA2_MLA=1 and on_gfx10x().
   rocm_ops.def(
       "sparse_mla_decode_rdna2(Tensor q, Tensor main_cache, "
       "Tensor main_indices, Tensor main_indptr, "
