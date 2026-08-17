@@ -191,6 +191,19 @@ TORCH_LIBRARY(_rocm_C, rocm_ops) {
   rocm_ops.impl("sparse_mla_decode_rdna2", torch::kCUDA,
                 &sparse_mla_decode_rdna2);
 
+  // Sparse MLA prefill for DeepSeek V4 (gfx1030). Replaces the Triton
+  // _sparse_attn_prefill_ragged_kernel path on gfx1030. Same
+  // online-softmax structure as sparse_mla_decode_rdna2 but kv rows are
+  // plain fp16/bf16 (no fp8 slots, no E8M0 scales). q/out may be fp16
+  // (gfx1030) or bf16 (RDNA3+). Gated by VLLM_USE_RDNA2_MLA=1 and
+  // on_gfx10x().
+  rocm_ops.def(
+      "sparse_mla_prefill_rdna2(Tensor q, Tensor kv, "
+      "Tensor indices, Tensor indptr, int num_kv, float scale, "
+      "Tensor attn_sink, Tensor(a!) out) -> ()");
+  rocm_ops.impl("sparse_mla_prefill_rdna2", torch::kCUDA,
+                &sparse_mla_prefill_rdna2);
+
 #endif
 
 #ifdef VLLM_ROCM_GFX1100

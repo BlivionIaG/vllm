@@ -200,3 +200,20 @@ void sparse_mla_decode_rdna2(
     double scale,
     torch::Tensor attn_sink,          // [H] fp32 or empty
     torch::Tensor out);               // [B, H, D] bf16
+
+// Sparse MLA prefill for DeepSeek V4 on AMD RDNA2 (gfx1030).
+// Replaces the Triton `_sparse_attn_prefill_ragged_kernel` path on
+// gfx1030. Same online-softmax structure as sparse_mla_decode_rdna2,
+// but the kv rows are plain fp16/bf16 (no fp8 slots, no E8M0 scales —
+// the fp8_ds_mla cache encoding only applies post-encoder). One CTA per
+// (query, head-group), 32 threads (wave32). Gated by
+// VLLM_USE_RDNA2_MLA=1 and on_gfx10x().
+void sparse_mla_prefill_rdna2(
+    torch::Tensor q,                  // [T, H, D] fp16 or bf16
+    torch::Tensor kv,                 // [skv, D] fp16/bf16 (contiguous rows)
+    torch::Tensor indices,            // [nnz] int32
+    torch::Tensor indptr,             // [T + 1] int32
+    int64_t num_kv,
+    double scale,
+    torch::Tensor attn_sink,          // [H] fp32 or empty
+    torch::Tensor out);               // [T, H, D] same dtype as q

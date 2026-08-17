@@ -771,6 +771,40 @@ def rocm_rdna2_sparse_attn_decode(
     output.copy_(attn_out.to(output.dtype))
 
 
+def _hip_sparse_attn_prefill(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    indptr: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor | None,
+    output: torch.Tensor,
+) -> None:
+    logger.info_once(
+        "RDNA2 sparse MLA prefill using HIP kernel sparse_mla_prefill_rdna2")
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError(
+            f"RDNA2 HIP sparse MLA prefill expects fp16 or bf16 q, got {q.dtype}")
+    B, H, D = q.shape
+    num_kv = kv.shape[0]
+    if attn_sink is None:
+        sink = torch.empty(0, device=q.device, dtype=torch.float32)
+    else:
+        sink = attn_sink[:H].to(torch.float32).contiguous()
+    out = torch.empty(B, H, D, device=q.device, dtype=q.dtype)
+    torch.ops._rocm_C.sparse_mla_prefill_rdna2(
+        q,
+        kv,
+        indices.to(torch.int32).contiguous(),
+        indptr.to(torch.int32).contiguous(),
+        num_kv,
+        float(scale),
+        sink,
+        out,
+    )
+    output.copy_(out)
+
+
 def rocm_rdna2_sparse_attn_prefill(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -794,6 +828,38 @@ def rocm_rdna2_sparse_attn_prefill(
         rope_head_dim,
         "rocm_rdna2_sparse_attn_prefill",
     )
+    # HIP path: plain fp16/bf16 kv rows + ragged indices, no fp8 slots.
+    if is_available():
+        if ragged_indices is not None and ragged_indptr is not None:
+            _hip_sparse_attn_prefill(
+                q=q,
+                kv=kv.squeeze(1),
+                indices=ragged_indices,
+                indptr=ragged_indptr,
+                scale=scale,
+                attn_sink=attn_sink,
+                output=output,
+            )
+        else:
+            indices_2d = indices.reshape(indices.shape[0], -1)
+            rag_indices, rag_indptr = build_ragged_indices_from_dense(
+                indices_2d,
+                topk_length
+                if topk_length is not None
+                else (indices_2d >= 0).sum(dim=-1, dtype=torch.int32),
+                num_rows=kv.shape[0],
+            )
+            _hip_sparse_attn_prefill(
+                q=q,
+                kv=kv.squeeze(1),
+                indices=rag_indices,
+                indptr=rag_indptr,
+                scale=scale,
+                attn_sink=attn_sink,
+                output=output,
+            )
+        return
+
     if q.dtype != torch.float16:
         q = q.to(torch.float16)
     if kv.dtype != torch.float16:

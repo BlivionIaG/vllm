@@ -478,10 +478,276 @@ void sparse_mla_decode_launcher(
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Sparse MLA prefill for gfx1030 (RDNA2).
+//
+// Prefill feeds plain fp16 kv rows ([skv, D] contiguous, no fp8 slots, no
+// E8M0 scales — the fp8_ds_mla cache format only applies after the KV
+// encoder writes). Same online-softmax structure as the decode kernel but
+// with direct scalar_t loads instead of the fp8 dequant path.
+//
+// Parallelization mirrors decode:
+//   - Grid:  (T, H / HEADS_PER_CTA)  — one CTA per (query, head-group)
+//   - Block: (32,)                   — 1 wave32
+//   - Thread t owns nope dims [14t, 14t+14) and rope dims [2t, 2t+2) of
+//     every head in the CTA; q and accumulators stay in registers.
+//   - Each row = COMB_DIM scalar_t = COMB_DIM*2 bytes = 64 float4 chunks,
+//     staged double-buffered in smem with one __syncthreads per row.
+// ---------------------------------------------------------------------------
+template <typename scalar_t>
+__global__ void __launch_bounds__(THREADS) sparse_mla_prefill_kernel(
+    const scalar_t* __restrict__ q,            // [T, d_num_heads, COMB_DIM]
+    int q_stride0,                                    // query stride
+    int q_stride1,                                    // head stride
+    int d_num_heads,                                  // 16 (K128) .. 64 (K256)
+    const scalar_t* __restrict__ kv,                  // [skv, COMB_DIM]
+    int kv_stride0,                                   // row stride (elems)
+    const int32_t* __restrict__ indices,              // [nnz]
+    const int32_t* __restrict__ indptr,               // [T + 1]
+    int num_kv,                                       // skv
+    float scale,
+    const float* __restrict__ attn_sink,              // [d_num_heads] or null
+    scalar_t* __restrict__ out,                       // [T, d_num_heads, COMB_DIM]
+    int out_stride0,
+    int out_stride1
+) {
+    const int query_idx = blockIdx.x;
+    const int h0 = blockIdx.y * HEADS_PER_CTA;
+    const int tid = threadIdx.x;
+    const int dn0 = tid * NOPE_PER_THREAD;
+    const int dr0 = tid * ROPE_PER_THREAD;
+
+    // Hoisted Q slice (same as decode).
+    float q_nope[HEADS_PER_CTA][NOPE_PER_THREAD];
+    float q_rope[HEADS_PER_CTA][ROPE_PER_THREAD];
+    #pragma unroll
+    for (int hh = 0; hh < HEADS_PER_CTA; hh++) {
+        const int h = h0 + hh;
+        const int h_safe = (h < d_num_heads) ? h : (d_num_heads - 1);
+        const bool head_ok = h < d_num_heads;
+        const scalar_t* q_row = q + (int64_t)query_idx * q_stride0
+            + (int64_t)h_safe * q_stride1;
+        #pragma unroll
+        for (int j = 0; j < NOPE_PER_THREAD; j++) {
+            q_nope[hh][j] = head_ok ? to_float<scalar_t>(q_row[dn0 + j]) : 0.0f;
+        }
+        #pragma unroll
+        for (int j = 0; j < ROPE_PER_THREAD; j++) {
+            q_rope[hh][j] = head_ok ? to_float<scalar_t>(q_row[NOPE_DIM + dr0 + j]) : 0.0f;
+        }
+    }
+
+    float m_i[HEADS_PER_CTA], l_i[HEADS_PER_CTA];
+    float acc_nope[HEADS_PER_CTA][NOPE_PER_THREAD];
+    float acc_rope[HEADS_PER_CTA][ROPE_PER_THREAD];
+    #pragma unroll
+    for (int hh = 0; hh < HEADS_PER_CTA; hh++) {
+        m_i[hh] = NEG_LARGE;
+        l_i[hh] = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < NOPE_PER_THREAD; j++) acc_nope[hh][j] = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < ROPE_PER_THREAD; j++) acc_rope[hh][j] = 0.0f;
+    }
+
+    // Double-buffered kv row staging: COMB_DIM*2 bytes = 64 float4 chunks.
+    __shared__ __align__(16) scalar_t s_kv[2][COMB_DIM];
+
+    const int range_start = indptr[query_idx];
+    const int range_len = indptr[query_idx + 1] - range_start;
+    if (range_len > 0) {
+        auto load_row = [&](int k, int buf) {
+            const int slot = indices[range_start + k];
+            if (slot < 0 || slot >= num_kv) return;
+            const scalar_t* src = kv + (int64_t)slot * kv_stride0;
+            float4* dst = reinterpret_cast<float4*>(s_kv[buf]);
+            const float4* src4 = reinterpret_cast<const float4*>(src);
+            #pragma unroll
+            for (int i = 0; i < COMB_DIM * (int)sizeof(scalar_t) / 16; i++) {
+                const int chunk = i * THREADS + tid;
+                dst[chunk] = src4[chunk];
+            }
+        };
+
+        load_row(0, 0);
+        __syncthreads();
+
+        for (int k = 0; k < range_len; k++) {
+            const int buf = k & 1;
+            const int slot = indices[range_start + k];
+            if (k + 1 < range_len) load_row(k + 1, buf ^ 1);
+
+            if (slot >= 0 && slot < num_kv) {
+                float k_nope[NOPE_PER_THREAD];
+                #pragma unroll
+                for (int j = 0; j < NOPE_PER_THREAD; j++) {
+                    k_nope[j] = to_float<scalar_t>(s_kv[buf][dn0 + j]);
+                }
+                float k_rope[ROPE_PER_THREAD];
+                #pragma unroll
+                for (int j = 0; j < ROPE_PER_THREAD; j++) {
+                    k_rope[j] = to_float<scalar_t>(s_kv[buf][NOPE_DIM + dr0 + j]);
+                }
+
+                #pragma unroll
+                for (int hh = 0; hh < HEADS_PER_CTA; hh++) {
+                    float partial = 0.0f;
+                    #pragma unroll
+                    for (int j = 0; j < NOPE_PER_THREAD; j++) {
+                        partial += q_nope[hh][j] * k_nope[j];
+                    }
+                    #pragma unroll
+                    for (int j = 0; j < ROPE_PER_THREAD; j++) {
+                        partial += q_rope[hh][j] * k_rope[j];
+                    }
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) {
+                        partial += __shfl_xor(partial, off);
+                    }
+                    const float score = partial * scale;
+
+                    const float m_new = fmaxf(m_i[hh], score);
+                    const float alpha = expf(m_i[hh] - m_new);
+                    const float p = expf(score - m_new);
+                    l_i[hh] = l_i[hh] * alpha + p;
+                    #pragma unroll
+                    for (int j = 0; j < NOPE_PER_THREAD; j++) {
+                        acc_nope[hh][j] = acc_nope[hh][j] * alpha + p * k_nope[j];
+                    }
+                    #pragma unroll
+                    for (int j = 0; j < ROPE_PER_THREAD; j++) {
+                        acc_rope[hh][j] = acc_rope[hh][j] * alpha + p * k_rope[j];
+                    }
+                    m_i[hh] = m_new;
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // Final normalize (with attn_sink if provided) and write out.
+    #pragma unroll
+    for (int hh = 0; hh < HEADS_PER_CTA; hh++) {
+        const int h = h0 + hh;
+        if (h >= d_num_heads) continue;  // padding head in last CTA
+        float m_final, l_final, alpha;
+        if (attn_sink != nullptr) {
+            const float sink = attn_sink[h];
+            m_final = fmaxf(m_i[hh], sink);
+            alpha = expf(m_i[hh] - m_final);
+            l_final = l_i[hh] * alpha + expf(sink - m_final);
+        } else {
+            m_final = m_i[hh];
+            alpha = 1.0f;
+            l_final = l_i[hh];
+        }
+        const float denom = fmaxf(l_final, 1e-30f);
+        const float inv_denom = (l_final > 0.0f) ? (1.0f / denom) : 0.0f;
+
+        scalar_t* out_row = out + (int64_t)query_idx * out_stride0
+            + (int64_t)h * out_stride1;
+        #pragma unroll
+        for (int j = 0; j < NOPE_PER_THREAD; j++) {
+            out_row[dn0 + j] = from_float<scalar_t>(
+                acc_nope[hh][j] * alpha * inv_denom);
+        }
+        #pragma unroll
+        for (int j = 0; j < ROPE_PER_THREAD; j++) {
+            out_row[NOPE_DIM + dr0 + j] = from_float<scalar_t>(
+                acc_rope[hh][j] * alpha * inv_denom);
+        }
+    }
+}
+
+
+// C++ launcher for the prefill kernel.
+void sparse_mla_prefill_launcher(
+    torch::Tensor q,                  // [T, H, D] fp16 or bf16
+    torch::Tensor kv,                 // [skv, D] fp16/bf16 (contiguous rows)
+    torch::Tensor indices,            // [nnz] int32
+    torch::Tensor indptr,             // [T + 1] int32
+    int num_kv,
+    double scale,
+    torch::Tensor attn_sink,          // [H] fp32 or empty
+    torch::Tensor out                 // [T, H, D] same dtype as q
+) {
+    TORCH_CHECK(q.is_cuda() && (q.scalar_type() == torch::kFloat16 ||
+                                q.scalar_type() == torch::kBFloat16),
+                "q must be fp16 or bf16 on CUDA");
+    TORCH_CHECK(kv.is_cuda() && kv.scalar_type() == q.scalar_type(),
+                "kv dtype must match q");
+    TORCH_CHECK(indices.is_cuda() && indices.scalar_type() == torch::kInt32);
+    TORCH_CHECK(indptr.is_cuda() && indptr.scalar_type() == torch::kInt32);
+    TORCH_CHECK(out.is_cuda() && out.scalar_type() == q.scalar_type(),
+                "out dtype must match q");
+
+    const int T = q.size(0);
+    const int H = q.size(1);
+    const int D = q.size(2);
+    TORCH_CHECK(H >= 1 && H % HEADS_PER_CTA == 0,
+                "expected H multiple of 4, got ", H);
+    TORCH_CHECK(D == COMB_DIM, "expected D=512");
+    TORCH_CHECK(indptr.numel() == (int64_t)T + 1,
+                "expected indptr [T+1]");
+    TORCH_CHECK(kv.size(1) == D, "expected kv rows of width 512");
+    // Kernel stages rows via 16-byte float4 loads; require row start
+    // alignment = 8 scalar_t (16 bytes) and a 16-byte-multiple base.
+    TORCH_CHECK(kv.stride(0) % 8 == 0,
+                "kv row stride must be a multiple of 8 elements (16 bytes)");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(kv.data_ptr()) & 15) == 0,
+                "kv base must be 16-byte aligned");
+
+    const float* sink_ptr = nullptr;
+    if (attn_sink.defined() && attn_sink.numel() > 0) {
+        TORCH_CHECK(attn_sink.is_cuda() && attn_sink.scalar_type() == torch::kFloat32);
+        sink_ptr = attn_sink.data_ptr<float>();
+    }
+
+    dim3 grid(T, H / HEADS_PER_CTA);
+    dim3 block(THREADS);
+    hipStream_t stream = at::hip::getCurrentHIPStream();
+
+    if (q.scalar_type() == torch::kFloat16) {
+        sparse_mla_prefill_kernel<half><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const half*>(q.data_ptr()),
+            (int)q.stride(0),
+            (int)q.stride(1),
+            H,
+            reinterpret_cast<const half*>(kv.data_ptr()),
+            (int)kv.stride(0),
+            indices.data_ptr<int32_t>(),
+            indptr.data_ptr<int32_t>(),
+            num_kv,
+            (float)scale,
+            sink_ptr,
+            reinterpret_cast<half*>(out.data_ptr()),
+            (int)out.stride(0),
+            (int)out.stride(1)
+        );
+    } else {
+        sparse_mla_prefill_kernel<__hip_bfloat16><<<grid, block, 0, stream>>>(
+            reinterpret_cast<const __hip_bfloat16*>(q.data_ptr()),
+            (int)q.stride(0),
+            (int)q.stride(1),
+            H,
+            reinterpret_cast<const __hip_bfloat16*>(kv.data_ptr()),
+            (int)kv.stride(0),
+            indices.data_ptr<int32_t>(),
+            indptr.data_ptr<int32_t>(),
+            num_kv,
+            (float)scale,
+            sink_ptr,
+            reinterpret_cast<__hip_bfloat16*>(out.data_ptr()),
+            (int)out.stride(0),
+            (int)out.stride(1)
+        );
+    }
+}
+
 }  // namespace rdna2_mla
 
-// Global wrapper matching the declaration in ops.h. torch_bindings.cpp
-// registers this symbol under the _rocm_C library.
+// Global wrapper matching the declaration in ops.h.
 void sparse_mla_decode_rdna2(
     torch::Tensor q,                  // [B, H, D] bf16
     torch::Tensor main_cache,         // [num_blocks, block_size, 584] uint8
@@ -505,5 +771,23 @@ void sparse_mla_decode_rdna2(
         static_cast<int>(main_num_rows),
         static_cast<int>(extra_block_size),
         static_cast<int>(extra_num_rows),
+        scale, attn_sink, out);
+}
+
+
+// Global wrapper matching the declaration in ops.h.
+void sparse_mla_prefill_rdna2(
+    torch::Tensor q,                  // [T, H, D] fp16 or bf16
+    torch::Tensor kv,                 // [skv, D] fp16/bf16 (contiguous rows)
+    torch::Tensor indices,            // [nnz] int32
+    torch::Tensor indptr,             // [T + 1] int32
+    int64_t num_kv,
+    double scale,
+    torch::Tensor attn_sink,          // [H] fp32 or empty
+    torch::Tensor out                 // [T, H, D] same dtype as q
+) {
+    rdna2_mla::sparse_mla_prefill_launcher(
+        q, kv, indices, indptr,
+        static_cast<int>(num_kv),
         scale, attn_sink, out);
 }
