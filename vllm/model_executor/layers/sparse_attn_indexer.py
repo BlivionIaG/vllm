@@ -841,10 +841,9 @@ class SparseAttnIndexer(CustomOp):
     ) -> torch.Tensor:
         # AITER is CDNA-only and crashes on gfx1030. This path uses our
         # local `paged_mqa_logits_decode_rdna2` HIP kernel for the MQA
-        # logits and `torch.topk` for top-K selection.
+        # logits and `top_k_per_row_decode` (radix-select) for top-K.
         from vllm.forward_context import get_forward_context
         from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-            _topk_indices_torch,
             indexer_k_quant_and_cache_triton,
         )
 
@@ -882,10 +881,6 @@ class SparseAttnIndexer(CustomOp):
         weights: torch.Tensor,
         layer_meta: DeepseekV32IndexerMetadata,
     ) -> torch.Tensor:
-        from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
-            _topk_indices_torch,
-        )
-
         decode_meta = layer_meta.decode
         assert decode_meta is not None
         num_decode_tokens = layer_meta.num_decode_tokens
@@ -930,11 +925,24 @@ class SparseAttnIndexer(CustomOp):
             decode_meta.block_table,
             self.max_model_len,
         )
+        num_rows = logits.shape[0]
         topk_view = self.topk_indices_buffer[
-            : batch_size * next_n, : self.topk_tokens
+            : num_rows, : self.topk_tokens
         ]
-        idx = _topk_indices_torch(logits, self.topk_tokens)
-        topk_view.copy_(idx)
+        # Radix-select top-k per row (the same kernel upstream uses), instead
+        # of a full torch.topk sort per row. Reads logits[0, rowEnd) where
+        # rowEnd is derived from seq_lens, so the -inf-padded columns past
+        # each row's context length are never touched.
+        ops.top_k_per_row_decode(
+            logits,
+            next_n,
+            seq_lens,
+            topk_view,
+            num_rows,
+            logits.stride(0),
+            logits.stride(1),
+            self.topk_tokens,
+        )
         if decode_meta.requires_padding:
             unpacked = unpack_seq_triton(
                 topk_view.view(batch_size, next_n, -1),
