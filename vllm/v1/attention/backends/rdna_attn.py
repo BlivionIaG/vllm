@@ -167,19 +167,30 @@ class RdnaAttentionMetadataBuilder(AttentionMetadataBuilder):
         self._device = device
 
     def build(
-        self, common: CommonAttentionMetadata
+        self,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
     ) -> RdnaAttentionMetadata:
-        return RdnaAttentionMetadata.from_common(common)
+        return RdnaAttentionMetadata.from_common(common_attn_metadata)
 
     def build_for_cudagraph_capture(
-        self, common: CommonAttentionMetadata
+        self, common_attn_metadata: CommonAttentionMetadata
     ) -> RdnaAttentionMetadata:
-        return self.build(common)
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+        )
 
     def build_for_drafting(
-        self, common: CommonAttentionMetadata
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
     ) -> RdnaAttentionMetadata:
-        return self.build(common)
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +269,9 @@ class RdnaAttentionImpl(AttentionImpl):
             return False
         if key_cache.dim() != 5 or value_cache.dim() != 5:
             return False
-        if is_quantized_kv_cache(self.kv_cache_dtype):
+        from vllm.v1.kv_cache_interface import get_kv_quant_mode, KVQuantMode
+        qm = get_kv_quant_mode(self.kv_cache_dtype)
+        if qm not in (KVQuantMode.NONE, KVQuantMode.FP8_PER_TENSOR, KVQuantMode.INT8_PER_TOKEN_HEAD):
             return False
         num_q_heads = query.shape[1] if query.dim() >= 2 else 0
         num_kv_heads = key_cache.shape[1] if key_cache.dim() >= 2 else 0
@@ -327,12 +340,42 @@ class RdnaAttentionImpl(AttentionImpl):
         if attn_metadata is None:
             return output.fill_(0)  # type: ignore[union-attr]
 
-        # 1. KV-cache split via vLLM's canonical helper.
-        key_cache, value_cache = PagedAttention.split_kv_cache(
-            kv_cache, self.num_kv_heads, self.head_size
-        )
-        # 2. Re-interp V 4D->5D if needed.
-        value_cache = self._maybe_reinterp_v_to_5d(key_cache, value_cache)
+        # 1. KV-cache split. For INT8_PER_TOKEN_HEAD, vLLM allocates
+        # the kv_cache with interleaved per-slot float32 scales: layout
+        # is (2, num_blocks, H_kv, head_size + 4, block_size) in int8
+        # storage where the last 4 bytes per "head row" per slot are the
+        # raw float32 scale for that (token, head). We split it into
+        # values + per-slot float32 scales here.
+        from vllm.v1.kv_cache_interface import get_kv_quant_mode, KVQuantMode
+        _split_qm = get_kv_quant_mode(self.kv_cache_dtype)
+        if _split_qm == KVQuantMode.INT8_PER_TOKEN_HEAD:
+            num_blocks = kv_cache.shape[1]
+            block_sz = kv_cache.shape[4]
+            _hs = self.head_size
+            key_cache = kv_cache[0, :, :, :_hs, :].reshape(
+                num_blocks, self.num_kv_heads, _hs, block_sz, 1
+            )
+            value_cache = kv_cache[1, :, :, :_hs, :].reshape(
+                num_blocks, self.num_kv_heads, _hs, block_sz, 1
+            )
+            k_scale_per_slot = kv_cache[0, :, :, _hs:_hs + 4, :].view(
+                torch.float32
+            ).squeeze(2)
+            v_scale_per_slot = kv_cache[1, :, :, _hs:_hs + 4, :].view(
+                torch.float32
+            ).squeeze(2)
+            num_tokens = num_blocks * block_sz
+            self._k_scale_tensor = k_scale_per_slot.transpose(1, 2).reshape(
+                num_tokens, self.num_kv_heads
+            ).contiguous()
+            self._v_scale_tensor = v_scale_per_slot.transpose(1, 2).reshape(
+                num_tokens, self.num_kv_heads
+            ).contiguous()
+        else:
+            key_cache, value_cache = PagedAttention.split_kv_cache(
+                kv_cache, self.num_kv_heads, self.head_size
+            )
+            value_cache = self._maybe_reinterp_v_to_5d(key_cache, value_cache)
         # 3. Gate check.
         if not self._can_run_fa_rdna2(query, key_cache, value_cache):
             raise NotImplementedError(
@@ -389,16 +432,45 @@ class RdnaAttentionImpl(AttentionImpl):
         # Decode path: max_seqlen_q <= 1.
         # ------------------------------------------------------------------
         if max_seqlen_q <= 1:
-            out_paged = fa.fa_rdna2_decode_paged(
-                query[:num_actual_tokens],
-                key_cache,
-                value_cache,
-                block_table,
-                seqused_k,
-                paged_block_size,
-                kv_splits=8,
-                sliding_window=sliding_window,
-            )
+            from vllm.v1.kv_cache_interface import get_kv_quant_mode, KVQuantMode
+            _qm = get_kv_quant_mode(self.kv_cache_dtype)
+            if _qm == KVQuantMode.INT8_PER_TOKEN_HEAD:
+                out_paged = fa.fa_rdna2_decode_paged_int8(
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    seqused_k,
+                    paged_block_size,
+                    kv_splits=8,
+                    sliding_window=sliding_window,
+                    k_scale=getattr(self, "_k_scale_tensor", None),
+                    v_scale=getattr(self, "_v_scale_tensor", None),
+                )
+            elif is_quantized_kv_cache(self.kv_cache_dtype):
+                out_paged = fa.fa_rdna2_decode_paged_fp8(
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    seqused_k,
+                    paged_block_size,
+                    kv_splits=8,
+                    sliding_window=sliding_window,
+                    k_scale=getattr(self, "_k_scale_float", 1.0),
+                    v_scale=getattr(self, "_v_scale_float", 1.0),
+                )
+            else:
+                out_paged = fa.fa_rdna2_decode_paged(
+                    query[:num_actual_tokens],
+                    key_cache,
+                    value_cache,
+                    block_table,
+                    seqused_k,
+                    paged_block_size,
+                    kv_splits=8,
+                    sliding_window=sliding_window,
+                )
             output[:num_actual_tokens].view(
                 num_actual_tokens,
                 self.num_heads,
@@ -414,7 +486,40 @@ class RdnaAttentionImpl(AttentionImpl):
         _kv_splits = min(8, (max_seqlen_k + 1023) // 1024)
         causal = bool(getattr(attn_metadata, "causal", False))
 
-        if max_seqlen_k < 4096 and self.head_size == 128:
+        from vllm.v1.kv_cache_interface import get_kv_quant_mode, KVQuantMode
+        _qm_p = get_kv_quant_mode(self.kv_cache_dtype)
+        _int8_prefill = False
+        if _qm_p == KVQuantMode.INT8_PER_TOKEN_HEAD:
+            _nb = key_cache.shape[0]
+            _bs = key_cache.shape[3]
+            _k_sc = self._k_scale_tensor.reshape(
+                _nb, _bs, self.num_kv_heads
+            ).transpose(1, 2).unsqueeze(2)
+            _v_sc = self._v_scale_tensor.reshape(
+                _nb, _bs, self.num_kv_heads
+            ).transpose(1, 2).unsqueeze(2)
+            key_cache = (
+                key_cache.squeeze(-1).to(torch.float32) * _k_sc
+            ).to(torch.float16).unsqueeze(-1)
+            value_cache = (
+                value_cache.squeeze(-1).to(torch.float32) * _v_sc
+            ).to(torch.float16).unsqueeze(-1)
+            _int8_prefill = True
+        if not _int8_prefill and is_quantized_kv_cache(self.kv_cache_dtype):
+            out_paged_prefill = fa.fa_rdna2_prefill_paged_varlen_fp8(
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                block_table,
+                cu_seqlens_q,
+                seqused_k,
+                paged_block_size,
+                causal=causal,
+                sliding_window=sliding_window,
+                k_scale=getattr(self, "_k_scale_float", 1.0),
+                v_scale=getattr(self, "_v_scale_float", 1.0),
+            )
+        elif max_seqlen_k < 4096 and self.head_size == 128:
             out_paged_prefill = fa.fa_rdna2_prefill_paged_varlen_short(
                 query[:num_actual_tokens],
                 key_cache,
@@ -517,6 +622,12 @@ class RdnaAttentionBackend(AttentionBackend):
               )
     """
 
+    supported_kv_cache_dtypes = ["auto", "float16", "bfloat16", "fp8", "int8_per_token_head"]
+
+    @classmethod
+    def supports_per_head_quant_scales(cls) -> bool:
+        return True
+
     @staticmethod
     def get_name() -> str:
         return "RDNA_ATTN"
@@ -536,6 +647,20 @@ class RdnaAttentionBackend(AttentionBackend):
     @staticmethod
     def get_state_cls() -> type | None:
         return None
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if block_size % 16 != 0:
+            raise ValueError("Block size must be a multiple of 16.")
+        if cache_dtype_str == "int8_per_token_head":
+            return (2, num_blocks, num_kv_heads, head_size + 4, block_size)
+        return (2, num_blocks, num_kv_heads, head_size, block_size)
 
     @classmethod
     def get_kv_cache_spec(

@@ -16,6 +16,12 @@ import os
 import torch
 from torch.utils.cpp_extension import load_inline
 
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
+torch._dynamo.config.cache_size_limit = 256
+_DYNAMO_CONFIG_APPLIED = True
+
+
 _KERNEL_SRC = None
 _EXT = None
 
@@ -39,6 +45,18 @@ def _load_kernel():
     with open(kernel_path) as f:
         _KERNEL_SRC = f.read()
 
+    # load_inline does not inherit the ROCm SDK include/library paths that
+    # the main cmake build gets from ROCM_HOME, so torch's header-only
+    # include chain (thrust/complex.h etc.) and the hip runtime link
+    # (-lamdhip64) are not found by default. Probe candidates in order.
+    _extra_rocm_includes = []
+    _extra_rocm_libdirs = []
+    for _cand in ("/opt/rocm-7.2.0/core-7.14", "/opt/rocm", "/opt/rocm-7.2.0"):
+        if pathlib.Path(_cand, "include", "thrust", "complex.h").is_file():
+            _extra_rocm_includes = ["-isystem" + _cand + "/include"]
+        if pathlib.Path(_cand, "lib", "libamdhip64.so").is_file():
+            _extra_rocm_libdirs = ["-L" + _cand + "/lib"]
+
     cpp_src = """
 torch::Tensor fa_rdna2_decode_paged(torch::Tensor Q,
                                     torch::Tensor key_cache,
@@ -47,6 +65,14 @@ torch::Tensor fa_rdna2_decode_paged(torch::Tensor Q,
                                     torch::Tensor seq_lens,
                                     int64_t block_size, int64_t kv_splits,
                                     int64_t sliding_window);
+torch::Tensor fa_rdna2_decode_paged_fp8(torch::Tensor Q,
+                                        torch::Tensor key_cache,
+                                        torch::Tensor value_cache,
+                                        torch::Tensor block_table,
+                                        torch::Tensor seq_lens,
+                                        int64_t block_size, int64_t kv_splits,
+                                        int64_t sliding_window,
+                                        double k_scale, double v_scale);
 torch::Tensor fa_rdna2_prefill_paged_varlen(torch::Tensor Q,
                                             torch::Tensor key_cache,
                                             torch::Tensor value_cache,
@@ -56,6 +82,26 @@ torch::Tensor fa_rdna2_prefill_paged_varlen(torch::Tensor Q,
                                             int64_t block_size,
                                             int64_t causal,
                                             int64_t sliding_window);
+torch::Tensor fa_rdna2_prefill_paged_varlen_fp8(torch::Tensor Q,
+                                                torch::Tensor key_cache,
+                                                torch::Tensor value_cache,
+                                                torch::Tensor block_table,
+                                                torch::Tensor cu_query_lens,
+                                                torch::Tensor seq_lens,
+                                                int64_t block_size,
+                                                int64_t causal,
+                                                int64_t sliding_window,
+                                                double k_scale,
+                                                double v_scale);
+torch::Tensor fa_rdna2_decode_paged_int8(torch::Tensor Q,
+                                         torch::Tensor key_cache,
+                                         torch::Tensor value_cache,
+                                         torch::Tensor block_table,
+                                         torch::Tensor seq_lens,
+                                         int64_t block_size, int64_t kv_splits,
+                                         int64_t sliding_window,
+                                         torch::Tensor k_scale,
+                                         torch::Tensor v_scale);
 torch::Tensor fa_rdna2_prefill_paged_varlen_short(torch::Tensor Q,
                                                   torch::Tensor key_cache,
                                                   torch::Tensor value_cache,
@@ -82,10 +128,15 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(torch::Tensor Q,
         cpp_sources=[cpp_src],
         cuda_sources=[_KERNEL_SRC],
         functions=["fa_rdna2_decode_paged",
+                   "fa_rdna2_decode_paged_fp8",
+                   "fa_rdna2_decode_paged_int8",
                    "fa_rdna2_prefill_paged_varlen",
+                   "fa_rdna2_prefill_paged_varlen_fp8",
                    "fa_rdna2_prefill_paged_varlen_short",
                    "fa_rdna2_prefill_paged_varlen_splitk"],
-        extra_cuda_cflags=["-O3", "--offload-arch=gfx1030"],
+        extra_cuda_cflags=["-O3", "--offload-arch=gfx1030"]
+                          + _extra_rocm_includes,
+        extra_ldflags=_extra_rocm_libdirs,
         verbose=False,
     )
     return _EXT
@@ -146,6 +197,49 @@ def fa_rdna2_decode_paged(Q: torch.Tensor,
         block_size, kv_splits, sliding_window)
 
 
+def fa_rdna2_decode_paged_fp8(Q: torch.Tensor,
+                              key_cache: torch.Tensor,
+                              value_cache: torch.Tensor,
+                              block_table: torch.Tensor,
+                              seq_lens: torch.Tensor,
+                              block_size: int = 16,
+                              kv_splits: int = 8,
+                              sliding_window: int = 0,
+                              k_scale: float = 1.0,
+                              v_scale: float = 1.0) -> torch.Tensor:
+    """FA2 decode kernel for gfx1030 with fp8 (e4m3) KV cache.
+
+    Same kernel as fa_rdna2_decode_paged but K/V are read from an fp8
+    cache (uint8 storage) and dequantized fp8->fp16 inline at the KV
+    load point inside the HIP kernel, applying the per-tensor scales.
+
+    Args:
+        Q: [num_tokens, H_q, D] fp16 query tensor
+        key_cache: [num_blocks, H_kv, D/x, block_size, x] uint8 fp8 K cache
+        value_cache: [num_blocks, H_kv, D/x, block_size, x] uint8 fp8 V cache
+        block_table: [num_tokens, max_blocks] int32 per-query block indices
+        seq_lens: [num_tokens] int32 per-query KV length
+        block_size: physical block size (16, 32, etc.)
+        kv_splits: number of CTAs per head (1..16)
+        sliding_window: sliding window size (0 = no window)
+        k_scale: per-tensor fp8 scale for K
+        v_scale: per-tensor fp8 scale for V
+
+    Returns:
+        O: [num_tokens, H_q, D] fp16 attention output
+    """
+    ext = _load_kernel()
+    if key_cache.dtype != torch.uint8:
+        key_cache = key_cache.view(torch.uint8)
+    if value_cache.dtype != torch.uint8:
+        value_cache = value_cache.view(torch.uint8)
+    # DEBUG: log tensor shapes for diagnosis
+    import sys
+    return ext.fa_rdna2_decode_paged_fp8(
+        Q, key_cache, value_cache, block_table, seq_lens,
+        block_size, kv_splits, sliding_window, float(k_scale), float(v_scale))
+
+
 
 
 
@@ -185,6 +279,51 @@ def fa_rdna2_prefill_paged_varlen(Q: torch.Tensor,
     return ext.fa_rdna2_prefill_paged_varlen(
         Q, key_cache, value_cache, block_table, cu_query_lens, seq_lens,
         block_size, int(causal), sliding_window)
+
+
+def fa_rdna2_prefill_paged_varlen_fp8(Q: torch.Tensor,
+                                      key_cache: torch.Tensor,
+                                      value_cache: torch.Tensor,
+                                      block_table: torch.Tensor,
+                                      cu_query_lens: torch.Tensor,
+                                      seq_lens: torch.Tensor,
+                                      block_size: int = 16,
+                                      causal: bool = True,
+                                      sliding_window: int = 0,
+                                      k_scale: float = 1.0,
+                                      v_scale: float = 1.0) -> torch.Tensor:
+    """FA2 paged prefill kernel for gfx1030 with fp8 (e4m3) KV cache.
+
+    Same kernel as fa_rdna2_prefill_paged_varlen but K/V are read from an
+    fp8 cache (uint8 storage) and dequantized inline at the KV load point.
+
+    Supports HEAD_DIM=128 and HEAD_DIM=256.
+
+    Args:
+        Q: [num_tokens, H_q, D] fp16 query tensor
+        key_cache: [num_blocks, H_kv, D/x, block_size, x] uint8 fp8 K cache
+        value_cache: [num_blocks, H_kv, D/x, block_size, x] uint8 fp8 V cache
+        block_table: [num_seqs, max_blocks] int32 per-sequence block indices
+        cu_query_lens: [num_seqs + 1] int32 cumulative query counts
+        seq_lens: [num_seqs] int32 per-sequence KV length
+        block_size: physical block size (16, 32, 784, etc.)
+        causal: whether to apply causal masking (per-sequence)
+        sliding_window: sliding window size (0 = no window)
+        k_scale: per-tensor fp8 scale for K
+        v_scale: per-tensor fp8 scale for V
+
+    Returns:
+        O: [num_tokens, H_q, D] fp16 attention output
+    """
+    ext = _load_kernel()
+    if key_cache.dtype != torch.uint8:
+        key_cache = key_cache.view(torch.uint8)
+    if value_cache.dtype != torch.uint8:
+        value_cache = value_cache.view(torch.uint8)
+    return ext.fa_rdna2_prefill_paged_varlen_fp8(
+        Q, key_cache, value_cache, block_table, cu_query_lens, seq_lens,
+        block_size, int(causal), sliding_window, float(k_scale),
+        float(v_scale))
 
 
 def fa_rdna2_prefill_paged_varlen_short(Q: torch.Tensor,
@@ -259,3 +398,52 @@ def fa_rdna2_prefill_paged_varlen_splitk(Q: torch.Tensor,
     return ext.fa_rdna2_prefill_paged_varlen_splitk(
         Q, key_cache, value_cache, block_table, cu_query_lens, seq_lens,
         block_size, int(causal), int(kv_splits), sliding_window)
+
+
+fa_rdna2_decode_paged = torch.compiler.allow_in_graph(fa_rdna2_decode_paged)
+fa_rdna2_decode_paged_fp8 = torch.compiler.allow_in_graph(fa_rdna2_decode_paged_fp8)
+fa_rdna2_prefill_paged_varlen = torch.compiler.allow_in_graph(fa_rdna2_prefill_paged_varlen)
+fa_rdna2_prefill_paged_varlen_fp8 = torch.compiler.allow_in_graph(fa_rdna2_prefill_paged_varlen_fp8)
+fa_rdna2_prefill_paged_varlen_short = torch.compiler.allow_in_graph(fa_rdna2_prefill_paged_varlen_short)
+fa_rdna2_prefill_paged_varlen_splitk = torch.compiler.allow_in_graph(fa_rdna2_prefill_paged_varlen_splitk)
+
+
+def fa_rdna2_decode_paged_int8(Q, key_cache, value_cache, block_table, seq_lens,
+                               block_size=16, kv_splits=8, sliding_window=0,
+                               k_scale=None, v_scale=None):
+    ext = _load_kernel()
+    if k_scale is None or v_scale is None:
+        raise ValueError("fa_rdna2_decode_paged_int8 requires k_scale/v_scale tensors")
+    if k_scale.dtype != torch.float32:
+        k_scale = k_scale.float()
+    if v_scale.dtype != torch.float32:
+        v_scale = v_scale.float()
+    return ext.fa_rdna2_decode_paged_int8(
+        Q, key_cache, value_cache, block_table, seq_lens,
+        block_size, kv_splits, sliding_window, k_scale, v_scale)
+
+
+fa_rdna2_decode_paged_int8 = torch.compiler.allow_in_graph(fa_rdna2_decode_paged_int8)
+
+_RDNA2_GFX10X = False
+try:
+    if torch.cuda.is_available():
+        _props = torch.cuda.get_device_properties(0)
+        _arch = getattr(_props, "gcnArchName", "")
+        if _arch.startswith("gfx103") or _arch.startswith("gfx10"):
+            _RDNA2_GFX10X = True
+except Exception:
+    _RDNA2_GFX10X = False
+
+if _RDNA2_GFX10X:
+    try:
+        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator as _PC
+        if not getattr(_PC, "_rdna2_patched", False):
+            _PC.disabled = property(lambda self: True)
+            _PC._rdna2_patched = True
+    except Exception as _e:
+        import warnings as _w
+        _w.warn(f"fa_rdna2 PyNcclCommunicator disabled-patch failed: {_e}", RuntimeWarning)
+
+
+
