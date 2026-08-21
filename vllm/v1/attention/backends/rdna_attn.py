@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import ClassVar, Optional
 
 import torch
 
@@ -63,6 +63,7 @@ from vllm.v1.attention.ops.paged_attn import PagedAttention
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
+    AttentionCGSupport,
     AttentionImpl,
     AttentionLayer,
     AttentionMetadata,
@@ -161,6 +162,8 @@ class RdnaAttentionMetadataBuilder(AttentionMetadataBuilder):
     """V1 metadata builder. Mirrors the chunked-prefill-ish defaults;
     FA-RDNA2 only needs block_table + seq_lens + max_query_len + max_seq_len
     + query_start_loc, all in CommonAttentionMetadata already."""
+
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
