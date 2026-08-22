@@ -623,6 +623,9 @@ class RdnaAttentionImpl(AttentionImpl):
         qm = get_kv_quant_mode(self.kv_cache_dtype)
         if qm == KVQuantMode.INT8_PER_TOKEN_HEAD:
             fa = _get_fa_rdna2_module()
+            # HIP kernel requires int32 slot_mapping; vLLM passes int64.
+            if slot_mapping.dtype != torch.int32:
+                slot_mapping = slot_mapping.to(torch.int32)
             fa.reshape_and_cache_int8_rdna2(
                 key, value, kv_cache, slot_mapping,
             )
