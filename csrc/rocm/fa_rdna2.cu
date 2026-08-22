@@ -512,10 +512,10 @@ __global__ __launch_bounds__(256, 1) void fa_decode_paged_splitk_kernel_256(
           // Same per-(token, head) int8 dequant as the 128 variant.
           const float k_s = k_scale_per_tok[n_global * H_kv + h_kv];
           const float v_s = v_scale_per_tok[n_global * H_kv + h_kv];
-          sK[i] = __hmul(__float2half((float)*k_ptr),
-                         __float2half(k_s));
-          sV[i] = __hmul(__float2half((float)*v_ptr),
-                         __float2half(v_s));
+          const float kf = (float)*k_ptr * k_s;
+          const float vf = (float)*v_ptr * v_s;
+          sK[i] = __float2half_rn(kf);
+          sV[i] = __float2half_rn(vf);
         } else {
           sK[i] = fa_kv_load<KV_T, IS_FP8>(k_ptr, k_scale);
           sV[i] = fa_kv_load<KV_T, IS_FP8>(v_ptr, v_scale);
@@ -3929,7 +3929,6 @@ void reshape_and_cache_int8_rdna2(
               "reshape_and_cache_int8_rdna2: only HEAD_DIM=128 or 256 supported");
 
   const int block_size = (int)kv_cache.size(4);
-  const int num_blocks = (int)kv_cache.size(1);
   TORCH_CHECK(block_size % 4 == 0,
               "block_size must be a multiple of 4 (4-byte scale alignment)");
 
