@@ -1331,7 +1331,6 @@ torch::Tensor wvSplitK(const at::Tensor& in_a, const at::Tensor& in_b,
 template <typename scalar_t, int THRDS, int YTILE, int WvPrGrp, int A_CHUNK,
           int UNRL, int N, int GrpsShrB, int CHUNKK, int DTRMNSTC>
 __global__ void __launch_bounds__(WvPrGrp* THRDS)
-    __attribute__((amdgpu_waves_per_eu(1, 1)))
     wvSplitKrc_(const int actlN, const int K, const int Kap, const int M,
                 const int Bx, const int By, const scalar_t* __restrict__ A,
                 const scalar_t* __restrict__ B,

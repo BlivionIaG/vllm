@@ -221,7 +221,8 @@ __device__ __forceinline__ half fa_kv_load(const KV_T* ptr, float scale) {
 // is the structural fix for OPT-D: replace the scalar-__hmul _pth stub with
 // the occupancy-fixed fp16 decode tile shape, fused i8 KV load via fdot2.
 template <typename KV_T, bool IS_FP8, bool IS_INT8 = false>
-__global__ __launch_bounds__(128, 1) void fa_decode_paged_splitk_kernel(
+__global__ __launch_bounds__(128)
+    __attribute__((amdgpu_waves_per_eu(4, 8))) void fa_decode_paged_splitk_kernel(
     const half* __restrict__ Q,
     const KV_T* __restrict__ key_cache,
     const KV_T* __restrict__ value_cache,
@@ -419,7 +420,8 @@ __global__ __launch_bounds__(128, 1) void fa_decode_paged_splitk_kernel(
 // mirrors the 128 variant — fused i8->fp16 dequant in the load loop, no
 // smem scale table.
 template <typename KV_T, bool IS_FP8, bool IS_INT8 = false>
-__global__ __launch_bounds__(256, 1) void fa_decode_paged_splitk_kernel_256(
+__global__ __launch_bounds__(256)
+    __attribute__((amdgpu_waves_per_eu(4, 8))) void fa_decode_paged_splitk_kernel_256(
     const half* __restrict__ Q,
     const KV_T* __restrict__ key_cache,
     const KV_T* __restrict__ value_cache,
