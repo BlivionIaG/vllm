@@ -306,10 +306,17 @@ class AutoAWQConfig(QuantizationConfig):
                 return AutoAWQMarlinLinearMethod(self)
 
             # Check if Marlin is supported and not using batch invariant mode
-            # (Marlin kernels are not batch invariant)
+            # (Marlin kernels are not batch invariant). gfx10x routes
+            # through choose_mp_linear_kernel -> RDNA2W4A16LinearKernel;
+            # other ROCm arches keep the Triton AWQ path unchanged.
+            from vllm.platforms.rocm import on_gfx10x
+
             use_marlin = (
                 not envs.VLLM_BATCH_INVARIANT
-                and current_platform.is_cuda()
+                and (
+                    current_platform.is_cuda()
+                    or (current_platform.is_rocm() and on_gfx10x())
+                )
                 and check_marlin_supported(
                     self.quant_type, self.group_size, self.zero_point
                 )
