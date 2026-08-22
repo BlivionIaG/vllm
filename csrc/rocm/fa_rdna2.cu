@@ -322,13 +322,15 @@ __global__ __launch_bounds__(128, 1) void fa_decode_paged_splitk_kernel(
         if constexpr (IS_INT8) {
           // Symmetric int8 with per-(token, head) scale. Read int8 byte,
           // sign-extend to fp32, multiply by per-(n_global, h_kv) scale,
-          // promote to fp16 for the smem tile (fdot2 path).
+          // promote to fp16 for the smem tile (fdot2 path). We compute
+          // the dequantization in fp32 (rather than via __hmul on fp16
+          // scales) to avoid extra fp16 rounding error on the scale itself.
           const float k_s = k_scale_per_tok[n_global * H_kv + h_kv];
           const float v_s = v_scale_per_tok[n_global * H_kv + h_kv];
-          sK[i] = __hmul(__float2half((float)*k_ptr),
-                         __float2half(k_s));
-          sV[i] = __hmul(__float2half((float)*v_ptr),
-                         __float2half(v_s));
+          const float kf = (float)*k_ptr * k_s;
+          const float vf = (float)*v_ptr * v_s;
+          sK[i] = __float2half_rn(kf);
+          sV[i] = __float2half_rn(vf);
         } else {
           sK[i] = fa_kv_load<KV_T, IS_FP8>(k_ptr, k_scale);
           sV[i] = fa_kv_load<KV_T, IS_FP8>(v_ptr, v_scale);
@@ -3754,18 +3756,10 @@ torch::Tensor fa_rdna2_decode_paged_int8(
     TORCH_CHECK(false, "int8 decode: only HEAD_DIM=128 or 256 supported");
   }
 
-  // Stage 2: combine partials across splits.
-  // Fast path: when kv_splits=1, O_partial[:, :, 0, :] IS the final
-  // output — skip the combine kernel launch entirely. This avoids
-  // breaking cudagraph capture (the host loop runs outside the graph
-  // and can't sync with the captured async kernel launch).
-  if ((int)kv_splits == 1) {
-    hipError_t err = hipGetLastError();
-    TORCH_CHECK(err == hipSuccess, "fa_rdna2 int8 decode launch failed: ",
-                hipGetErrorString(err));
-    return O_partial.select(2, 0);  // (N, H_q, 1, D) -> (N, H_q, D) view
-  }
-
+  // Stage 2: combine partials across splits (kernel writes raw o_acc +
+  // m_i + l_i, this kernel does the per-split online-softmax rescale and
+  // divides by l_total). Must run even for kv_splits=1 because the
+  // decode kernel writes unnormalized o_acc. Mirrors the FP8/fp16 path.
   dim3 grid2(num_tokens, H_q);
   dim3 block2(D);
   size_t smem2 = (3 * (int)kv_splits + 1) * sizeof(float);
