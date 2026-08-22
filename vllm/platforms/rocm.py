@@ -403,7 +403,7 @@ def use_rocm_custom_paged_attention(
             (_ON_GFX10X or _ON_GFX1X)
             and (sliding_window == 0 or sliding_window == (-1, -1))
             and (qtype == torch.half or qtype == torch.bfloat16)
-            and head_size == 128
+            and head_size in (128, 256)
             and block_size == 16
             and (gqa_ratio >= 3 and gqa_ratio <= 16)
             and max_seq_len <= 128 * 1024
