@@ -696,6 +696,39 @@ class RdnaAttentionBackend(AttentionBackend):
             dtype=dtype,
         )
 
+    forward_includes_kv_cache_update: bool = False
+
+    def do_kv_cache_update(
+        self,
+        layer: AttentionLayer,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ):
+        if self.attn_type in (
+            AttentionType.ENCODER_ONLY,
+            AttentionType.ENCODER,
+        ):
+            return
+        from vllm.v1.kv_cache_interface import get_kv_quant_mode, KVQuantMode
+        qm = get_kv_quant_mode(self.kv_cache_dtype)
+        if qm == KVQuantMode.INT8_PER_TOKEN_HEAD:
+            fa = _get_fa_rdna2_module()
+            fa.reshape_and_cache_int8_rdna2(
+                key, value, kv_cache, slot_mapping,
+            )
+            return
+        key_cache, value_cache = PagedAttention.split_kv_cache(
+            kv_cache, self.num_kv_heads, self.head_size
+        )
+        PagedAttention.write_to_paged_cache(
+            key, value, key_cache, value_cache,
+            slot_mapping, self.kv_cache_dtype,
+            getattr(layer, "_k_scale", None),
+            getattr(layer, "_v_scale", None),
+        )
+
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
         return head_size in _SUPPORTED_HEAD_SIZES

@@ -197,7 +197,7 @@ TORCH_LIBRARY(_rocm_C, rocm_ops) {
                 &sparse_mla_decode_rdna2);
 
   // Sparse MLA prefill for DeepSeek V4 (gfx1030). Replaces the Triton
-  // _sparse_attn_prefill_ragged_kernel path on gfx1030. Same
+  // `_sparse_attn_prefill_ragged_kernel` path on gfx1030. Same
   // online-softmax structure as sparse_mla_decode_rdna2 but kv rows are
   // plain fp16/bf16 (no fp8 slots, no E8M0 scales). q/out may be fp16
   // (gfx1030) or bf16 (RDNA3+). Gated by VLLM_USE_RDNA2_MLA=1 and
@@ -208,6 +208,18 @@ TORCH_LIBRARY(_rocm_C, rocm_ops) {
       "Tensor attn_sink, Tensor(a!) out) -> ()");
   rocm_ops.impl("sparse_mla_prefill_rdna2", torch::kCUDA,
                 &sparse_mla_prefill_rdna2);
+
+  // INT8 per-(token, head) KV-cache writer for RDNA2 (gfx1030).
+  // Quantizes fp16 K/V to int8 with per-(token, head) scales and writes
+  // them into the interleaved cache layout the RDNA2 FA decode kernel
+  // reads (D bytes data + 4 bytes scale per slot, per kv-int8.md wiki
+  // contract). Wired into vllm/v1/attention/backends/rdna_attn.py for
+  // the INT8_PER_TOKEN_HEAD kv_cache_dtype path.
+  rocm_ops.def(
+      "reshape_and_cache_int8_rdna2(Tensor key, Tensor value, "
+      "Tensor(a!) kv_cache, Tensor slot_mapping) -> ()");
+  rocm_ops.impl("reshape_and_cache_int8_rdna2", torch::kCUDA,
+                &reshape_and_cache_int8_rdna2);
 
 #endif
 

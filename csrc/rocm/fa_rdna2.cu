@@ -3782,4 +3782,182 @@ torch::Tensor fa_rdna2_decode_paged_int8(
 }
 
 
+// =====================================================================
+// INT8 PER-(TOKEN, HEAD) KV-CACHE WRITER (reshape_and_cache_int8_rdna2)
+// =====================================================================
+//
+// Symmetric signed int8 quantize + write. Layout (matches RDNA_ATTN
+// `get_kv_cache_shape` for cache_dtype_str == "int8_per_token_head"):
+//   kv_cache: [2, num_blocks, H_kv, D + 4, block_size] int8
+//     - kv_cache[0, b, h, 0..D, s]      : K int8 bytes (packed)
+//     - kv_cache[0, b, h, D..D + 4, s]  : K fp32 scale bytes (raw LE)
+//     - kv_cache[1, ...]                : V same
+//
+// One CTA per (token, head). Block size = HEAD_DIM threads (matches the
+// decode kernel's warp32 layout). Per-(token, head) absmax reduction via
+// warp_reduce_max + block_reduce_max (same helpers as the decode kernel).
+//
+// Scale = max(absmax / 127, 1e-6) per the kv-int8.md wiki contract.
+// Quantize: q[d] = round(K[d] / scale), clamp [-127, 127].
+// Store one int8 per D-element per slot. Scale stored as 4 LE bytes
+// (raw fp32 bits) at position D per slot.
+//
+// No atomic add needed — each (token, head) pair is written by exactly
+// one CTA so writes are race-free.
+//
+template <int HEAD_DIM>
+__global__ __launch_bounds__(HEAD_DIM, 4) void reshape_and_cache_int8_rdna2_kernel(
+    const half* __restrict__ key,         // [num_tokens, H_kv, D]
+    const half* __restrict__ value,       // [num_tokens, H_kv, D]
+    int8_t* __restrict__ key_cache,       // base of K cache [num_blocks, H_kv, D+4, block_size]
+    int8_t* __restrict__ value_cache,     // base of V cache [num_blocks, H_kv, D+4, block_size]
+    const int* __restrict__ slot_mapping, // [num_tokens]
+    const int num_tokens,
+    const int H_kv,
+    const int block_size) {
+  const int token_idx = blockIdx.x;
+  const int h_kv = blockIdx.y;
+  const int d = threadIdx.x;
 
+  // Slot for this token (-1 sentinel = skip).
+  const int slot = slot_mapping[token_idx];
+  if (slot < 0) return;
+  if (token_idx >= num_tokens || h_kv >= H_kv) return;
+
+  const int block_idx = slot / block_size;
+  const int slot_in_block = slot % block_size;
+
+  // Per-(token, head) absmax via warp+block reduce.
+  __shared__ float shared[10];
+  __shared__ float s_k_scale_sh;
+  __shared__ float s_v_scale_sh;
+
+  const half* k_row = key + (token_idx * H_kv + h_kv) * HEAD_DIM;
+  const half* v_row = value + (token_idx * H_kv + h_kv) * HEAD_DIM;
+
+  float k_x = (d < HEAD_DIM) ? __half2float(k_row[d]) : 0.0f;
+  float v_x = (d < HEAD_DIM) ? __half2float(v_row[d]) : 0.0f;
+  float k_amax_t = fabsf(k_x);
+  float v_amax_t = fabsf(v_x);
+
+  k_amax_t = warp_reduce_max(k_amax_t);
+  v_amax_t = warp_reduce_max(v_amax_t);
+  k_amax_t = block_reduce_max(k_amax_t, shared);
+  v_amax_t = block_reduce_max(v_amax_t, shared);
+
+  if (d == 0) {
+    s_k_scale_sh = fmaxf(k_amax_t / 127.0f, 1e-6f);
+    s_v_scale_sh = fmaxf(v_amax_t / 127.0f, 1e-6f);
+  }
+  __syncthreads();
+
+  const float k_inv = 1.0f / s_k_scale_sh;
+  const float v_inv = 1.0f / s_v_scale_sh;
+
+  // Contiguous-layout strides for [num_blocks, H_kv, D+4, block_size] int8.
+  //   stride_block = H_kv * (D+4) * block_size
+  //   stride_h     = (D+4) * block_size
+  //   stride_d     = block_size  (one slot at a time)
+  //   stride_s     = 1           (innermost)
+  const int row_bytes = (HEAD_DIM + 4) * block_size;
+  int8_t* k_dst = key_cache + block_idx * (H_kv * row_bytes) + h_kv * row_bytes;
+  int8_t* v_dst = value_cache + block_idx * (H_kv * row_bytes) + h_kv * row_bytes;
+
+  // Quantize + write one int8 per thread (D bytes per slot).
+  if (d < HEAD_DIM) {
+    const float kq = roundf(k_x * k_inv);
+    const float vq = roundf(v_x * v_inv);
+    const int8_t kb = (int8_t)max(-127, min(127, (int)kq));
+    const int8_t vb = (int8_t)max(-127, min(127, (int)vq));
+    k_dst[d * block_size + slot_in_block] = kb;
+    v_dst[d * block_size + slot_in_block] = vb;
+  }
+
+  // Scale bytes (raw fp32 LE) — 4 threads (d=0..3) each write 1 byte.
+  // Per the wiki, "Pack store as int (4×i8)" — equivalent to storing the
+  // 4 raw fp32 bytes at consecutive int8 positions.
+  if (d < 4) {
+    const int32_t k_bits = __float_as_int(s_k_scale_sh);
+    const int32_t v_bits = __float_as_int(s_v_scale_sh);
+    k_dst[HEAD_DIM * block_size + slot_in_block + d] =
+        (int8_t)((k_bits >> (d * 8)) & 0xFF);
+    v_dst[HEAD_DIM * block_size + slot_in_block + d] =
+        (int8_t)((v_bits >> (d * 8)) & 0xFF);
+  }
+}
+
+// Host wrapper: quantizes fp16 K/V to int8 with per-(token, head) scales
+// and writes them into the interleaved kv_cache (D bytes data + 4 bytes
+// scale per slot, per the kv-int8.md wiki contract).
+//
+// Inputs:
+//   key            : [num_tokens, H_kv, D] fp16
+//   value          : [num_tokens, H_kv, D] fp16
+//   kv_cache       : [2, num_blocks, H_kv, D + 4, block_size] int8
+//                    (in-place write — K cache at slice 0, V at slice 1)
+//   slot_mapping   : [num_tokens] int32 — global slot per token (-1 = skip)
+//
+void reshape_and_cache_int8_rdna2(
+    torch::Tensor key,
+    torch::Tensor value,
+    torch::Tensor kv_cache,
+    torch::Tensor slot_mapping) {
+  TORCH_CHECK(key.is_cuda() && value.is_cuda() && kv_cache.is_cuda() && slot_mapping.is_cuda(),
+              "key/value/kv_cache/slot_mapping must be on HIP device");
+  TORCH_CHECK(key.scalar_type() == torch::kHalf && value.scalar_type() == torch::kHalf,
+              "key/value must be fp16");
+  TORCH_CHECK(kv_cache.scalar_type() == torch::kInt8,
+              "kv_cache must be int8");
+  TORCH_CHECK(slot_mapping.scalar_type() == torch::kInt32,
+              "slot_mapping must be int32");
+  TORCH_CHECK(key.dim() == 3 && value.dim() == 3,
+              "key/value must be [num_tokens, H_kv, D]");
+  TORCH_CHECK(kv_cache.dim() == 5 && kv_cache.size(0) == 2,
+              "kv_cache must be [2, num_blocks, H_kv, D + 4, block_size]");
+  TORCH_CHECK(slot_mapping.dim() == 1, "slot_mapping must be [num_tokens]");
+
+  const int num_tokens = (int)key.size(0);
+  const int H_kv = (int)key.size(1);
+  const int D = (int)key.size(2);
+  TORCH_CHECK(value.size(0) == num_tokens && value.size(1) == H_kv &&
+              value.size(2) == D, "key/value shape mismatch");
+  TORCH_CHECK(kv_cache.size(2) == H_kv, "H_kv mismatch");
+  TORCH_CHECK(kv_cache.size(3) == D + 4,
+              "kv_cache D dim must be D + 4 (interleaved scale bytes)");
+  TORCH_CHECK(kv_cache.size(1) > 0, "num_blocks must be > 0");
+  TORCH_CHECK(D == 128 || D == 256,
+              "reshape_and_cache_int8_rdna2: only HEAD_DIM=128 or 256 supported");
+
+  const int block_size = (int)kv_cache.size(4);
+  const int num_blocks = (int)kv_cache.size(1);
+  TORCH_CHECK(block_size % 4 == 0,
+              "block_size must be a multiple of 4 (4-byte scale alignment)");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(key));
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  int8_t* k_cache_ptr = (int8_t*)kv_cache.data_ptr();  // slice 0 base
+  // Slice 1 base = base + 1 * stride(0). The slice 0/1 separation is the
+  // outermost kv dim; stride(0) is num_blocks * H_kv * (D+4) * block_size.
+  int8_t* v_cache_ptr = k_cache_ptr + kv_cache.stride(0);
+
+  dim3 grid(num_tokens, H_kv);
+  if (D == 128) {
+    reshape_and_cache_int8_rdna2_kernel<128><<<grid, 128, 0, stream.stream()>>>(
+        (const half*)key.data_ptr(),
+        (const half*)value.data_ptr(),
+        k_cache_ptr, v_cache_ptr,
+        (const int*)slot_mapping.data_ptr(),
+        num_tokens, H_kv, block_size);
+  } else {
+    reshape_and_cache_int8_rdna2_kernel<256><<<grid, 256, 0, stream.stream()>>>(
+        (const half*)key.data_ptr(),
+        (const half*)value.data_ptr(),
+        k_cache_ptr, v_cache_ptr,
+        (const int*)slot_mapping.data_ptr(),
+        num_tokens, H_kv, block_size);
+  }
+  hipError_t err = hipGetLastError();
+  TORCH_CHECK(err == hipSuccess, "reshape_and_cache_int8_rdna2 launch failed: ",
+              hipGetErrorString(err));
+}

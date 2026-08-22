@@ -102,6 +102,9 @@ torch::Tensor fa_rdna2_decode_paged_int8(torch::Tensor Q,
                                          int64_t sliding_window,
                                          torch::Tensor k_scale,
                                          torch::Tensor v_scale);
+void reshape_and_cache_int8_rdna2(torch::Tensor key, torch::Tensor value,
+                                  torch::Tensor kv_cache,
+                                  torch::Tensor slot_mapping);
 torch::Tensor fa_rdna2_prefill_paged_varlen_short(torch::Tensor Q,
                                                   torch::Tensor key_cache,
                                                   torch::Tensor value_cache,
@@ -146,7 +149,8 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_int8(torch::Tensor Q,
                    "fa_rdna2_prefill_paged_varlen_fp8",
                    "fa_rdna2_prefill_paged_varlen_short",
                    "fa_rdna2_prefill_paged_varlen_splitk",
-                   "fa_rdna2_prefill_paged_varlen_int8"],
+                   "fa_rdna2_prefill_paged_varlen_int8",
+                   "reshape_and_cache_int8_rdna2"],
         extra_cuda_cflags=["-O3", "--offload-arch=gfx1030"]
                           + _extra_rocm_includes,
         extra_ldflags=_extra_rocm_libdirs,
@@ -491,6 +495,33 @@ def fa_rdna2_decode_paged_int8(Q, key_cache, value_cache, block_table, seq_lens,
 
 
 fa_rdna2_decode_paged_int8 = torch.compiler.allow_in_graph(fa_rdna2_decode_paged_int8)
+
+
+def reshape_and_cache_int8_rdna2(key, value, kv_cache, slot_mapping):
+    """INT8 per-(token, head) KV-cache writer for RDNA2 (gfx1030).
+
+    Quantizes fp16 K/V to int8 with per-(token, head) scales (one
+    absmax / 127 per (token, head) pair) and writes them into the
+    interleaved cache layout consumed by fa_rdna2_decode_paged_int8:
+
+        kv_cache: [2, num_blocks, H_kv, D + 4, block_size] int8
+        - kv_cache[0, b, h, 0..D, s]      : K int8 bytes
+        - kv_cache[0, b, h, D..D + 4, s]  : K scale (raw fp32 LE)
+        - kv_cache[1, ...]                : V same
+
+    Per the kv-int8.md wiki contract. Slot mapping values of -1 are
+    treated as no-op (matching the vLLM standard semantics).
+
+    Returns:
+        None — writes into kv_cache in place.
+    """
+    ext = _load_kernel()
+    return ext.reshape_and_cache_int8_rdna2(
+        key, value, kv_cache, slot_mapping)
+
+
+reshape_and_cache_int8_rdna2 = torch.compiler.allow_in_graph(
+    reshape_and_cache_int8_rdna2)
 
 _RDNA2_GFX10X = False
 try:

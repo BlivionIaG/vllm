@@ -217,3 +217,18 @@ void sparse_mla_prefill_rdna2(
     double scale,
     torch::Tensor attn_sink,          // [H] fp32 or empty
     torch::Tensor out);               // [T, H, D] same dtype as q
+
+// INT8 per-(token, head) KV-cache writer for AMD RDNA2 (gfx1030).
+// Symmetric signed int8 quantize + write to the interleaved cache
+// layout used by RDNA_ATTN backend: [2, num_blocks, H_kv, D+4, block_size]
+// int8, with the last 4 int8 bytes per (block, head, slot) being the
+// raw fp32 K/V scale. Used by fa_rdna2_decode_paged_int8 to populate
+// the per-(token, head) scale tensor the kernel reads inside its
+// cooperative load. Per the kv-int8.md wiki contract — fused i8 quant
+// + scale computation in a single CTA per (token, head).
+void reshape_and_cache_int8_rdna2(
+    torch::Tensor key,         // [num_tokens, H_kv, D] fp16
+    torch::Tensor value,       // [num_tokens, H_kv, D] fp16
+    torch::Tensor kv_cache,    // [2, num_blocks, H_kv, D + 4, block_size] int8
+    torch::Tensor slot_mapping // [num_tokens] int32 (-1 = skip)
+);
