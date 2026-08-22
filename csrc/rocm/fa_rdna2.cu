@@ -205,7 +205,22 @@ __device__ __forceinline__ half fa_kv_load(const KV_T* ptr, float scale) {
 // HEAD_DIM = 128 specialization (the original kernel). A HEAD_DIM = 256
 // variant `fa_decode_paged_splitk_kernel_256` follows below for Qwen3.5.
 
-template <typename KV_T, bool IS_FP8>
+// HEAD_DIM = 128 specialization of the paged decode kernel.
+//
+// Template parameters:
+//   KV_T        : storage dtype (half, uint8_t, int8_t)
+//   IS_FP8      : KV_T=uint8_t fp8 (e4m3) — per-tensor scalar scale
+//   IS_INT8     : KV_T=int8_t signed int8 — per-(token, head) scale tensor
+//
+// For IS_INT8 the per-(token, head) scale tensor is `k_scale_per_tok` /
+// `v_scale_per_tok` shaped [N_kv_total, H_kv]. We look up the scale inline
+// at the KV load point — no smem scale table, no full-seq fp16 workspace.
+// The smem tile layout is identical to the FP8 path (per-block tile of
+// dequantized fp16 K/V) so the same online-softmax + fdot2 hot loop is
+// reused without code duplication. Per the kv-int8.md wiki contract, this
+// is the structural fix for OPT-D: replace the scalar-__hmul _pth stub with
+// the occupancy-fixed fp16 decode tile shape, fused i8 KV load via fdot2.
+template <typename KV_T, bool IS_FP8, bool IS_INT8 = false>
 __global__ __launch_bounds__(128, 1) void fa_decode_paged_splitk_kernel(
     const half* __restrict__ Q,
     const KV_T* __restrict__ key_cache,
@@ -231,7 +246,9 @@ __global__ __launch_bounds__(128, 1) void fa_decode_paged_splitk_kernel(
     const float scale,
     const int sliding_window,
     const float k_scale,
-    const float v_scale) {
+    const float v_scale,
+    const float* __restrict__ k_scale_per_tok,
+    const float* __restrict__ v_scale_per_tok) {
 
   const int token_idx = blockIdx.x;
   const int h_q = blockIdx.y;
@@ -302,8 +319,20 @@ __global__ __launch_bounds__(128, 1) void fa_decode_paged_splitk_kernel(
             + d_sub * stride_kc2
             + slot * stride_kc3
             + x_idx * stride_kc4;
-        sK[i] = fa_kv_load<KV_T, IS_FP8>(k_ptr, k_scale);
-        sV[i] = fa_kv_load<KV_T, IS_FP8>(v_ptr, v_scale);
+        if constexpr (IS_INT8) {
+          // Symmetric int8 with per-(token, head) scale. Read int8 byte,
+          // sign-extend to fp32, multiply by per-(n_global, h_kv) scale,
+          // promote to fp16 for the smem tile (fdot2 path).
+          const float k_s = k_scale_per_tok[n_global * H_kv + h_kv];
+          const float v_s = v_scale_per_tok[n_global * H_kv + h_kv];
+          sK[i] = __hmul(__float2half((float)*k_ptr),
+                         __float2half(k_s));
+          sV[i] = __hmul(__float2half((float)*v_ptr),
+                         __float2half(v_s));
+        } else {
+          sK[i] = fa_kv_load<KV_T, IS_FP8>(k_ptr, k_scale);
+          sV[i] = fa_kv_load<KV_T, IS_FP8>(v_ptr, v_scale);
+        }
       }
     }
     __syncthreads();
@@ -384,8 +413,10 @@ __global__ __launch_bounds__(128, 1) void fa_decode_paged_splitk_kernel(
 
 // HEAD_DIM = 256 specialization of the paged decode kernel for Qwen3.5 /
 // GDN hybrid models. Same algorithm as the 128 variant but with 256-element
-// query/key/value vectors and 256 threads per block.
-template <typename KV_T, bool IS_FP8>
+// query/key/value vectors and 256 threads per block. The IS_INT8 path
+// mirrors the 128 variant — fused i8->fp16 dequant in the load loop, no
+// smem scale table.
+template <typename KV_T, bool IS_FP8, bool IS_INT8 = false>
 __global__ __launch_bounds__(256, 1) void fa_decode_paged_splitk_kernel_256(
     const half* __restrict__ Q,
     const KV_T* __restrict__ key_cache,
@@ -411,7 +442,9 @@ __global__ __launch_bounds__(256, 1) void fa_decode_paged_splitk_kernel_256(
     const float scale,
     const int sliding_window,
     const float k_scale,
-    const float v_scale) {
+    const float v_scale,
+    const float* __restrict__ k_scale_per_tok,
+    const float* __restrict__ v_scale_per_tok) {
 
   const int token_idx = blockIdx.x;
   const int h_q = blockIdx.y;
@@ -475,8 +508,18 @@ __global__ __launch_bounds__(256, 1) void fa_decode_paged_splitk_kernel_256(
             + d_sub * stride_kc2
             + slot * stride_kc3
             + x_idx * stride_kc4;
-        sK[i] = fa_kv_load<KV_T, IS_FP8>(k_ptr, k_scale);
-        sV[i] = fa_kv_load<KV_T, IS_FP8>(v_ptr, v_scale);
+        if constexpr (IS_INT8) {
+          // Same per-(token, head) int8 dequant as the 128 variant.
+          const float k_s = k_scale_per_tok[n_global * H_kv + h_kv];
+          const float v_s = v_scale_per_tok[n_global * H_kv + h_kv];
+          sK[i] = __hmul(__float2half((float)*k_ptr),
+                         __float2half(k_s));
+          sV[i] = __hmul(__float2half((float)*v_ptr),
+                         __float2half(v_s));
+        } else {
+          sK[i] = fa_kv_load<KV_T, IS_FP8>(k_ptr, k_scale);
+          sV[i] = fa_kv_load<KV_T, IS_FP8>(v_ptr, v_scale);
+        }
       }
     }
     __syncthreads();
@@ -2614,9 +2657,9 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
                  + BC * sizeof(float)
                  + (THREADS / 32 + 1) * sizeof(float);
     hipFuncSetAttribute(
-        reinterpret_cast<const void*>(fa_decode_paged_splitk_kernel<half, false>),
+        reinterpret_cast<const void*>(fa_decode_paged_splitk_kernel<half, false, false>),
         hipFuncAttributeMaxDynamicSharedMemorySize, smem1);
-    fa_decode_paged_splitk_kernel<half, false><<<grid1, block1, smem1, stream.stream()>>>(
+    fa_decode_paged_splitk_kernel<half, false, false><<<grid1, block1, smem1, stream.stream()>>>(
         (const half*)Q.data_ptr(),
         (const half*)key_cache.data_ptr(),
         (const half*)value_cache.data_ptr(),
@@ -2635,7 +2678,8 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
         (float*)L_partial.data_ptr(),
         num_tokens, H_q, H_kv,
         (int)kv_splits, kv_group_num, scale, (int)sliding_window,
-        0.0f, 0.0f);
+        0.0f, 0.0f,
+        nullptr, nullptr);
   } else {
     constexpr int HEAD_DIM = 256;
     constexpr int THREADS = 256;
@@ -2646,9 +2690,9 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
                  + BC_LOC * sizeof(float)
                  + (THREADS / 32 + 1) * sizeof(float);
     hipFuncSetAttribute(
-        reinterpret_cast<const void*>(fa_decode_paged_splitk_kernel_256<half, false>),
+        reinterpret_cast<const void*>(fa_decode_paged_splitk_kernel_256<half, false, false>),
         hipFuncAttributeMaxDynamicSharedMemorySize, smem1);
-    fa_decode_paged_splitk_kernel_256<half, false><<<grid1, block1, smem1, stream.stream()>>>(
+    fa_decode_paged_splitk_kernel_256<half, false, false><<<grid1, block1, smem1, stream.stream()>>>(
         (const half*)Q.data_ptr(),
         (const half*)key_cache.data_ptr(),
         (const half*)value_cache.data_ptr(),
@@ -2667,7 +2711,8 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
         (float*)L_partial.data_ptr(),
         num_tokens, H_q, H_kv,
         (int)kv_splits, kv_group_num, scale, (int)sliding_window,
-        0.0f, 0.0f);
+        0.0f, 0.0f,
+        nullptr, nullptr);
   }
   hipError_t err1 = hipGetLastError();
   TORCH_CHECK(err1 == hipSuccess,
@@ -2770,9 +2815,9 @@ torch::Tensor fa_rdna2_decode_paged_fp8(
                  + BC * sizeof(float)
                  + (THREADS / 32 + 1) * sizeof(float);
     hipFuncSetAttribute(
-        reinterpret_cast<const void*>(fa_decode_paged_splitk_kernel<uint8_t, true>),
+        reinterpret_cast<const void*>(fa_decode_paged_splitk_kernel<uint8_t, true, false>),
         hipFuncAttributeMaxDynamicSharedMemorySize, smem1);
-    fa_decode_paged_splitk_kernel<uint8_t, true><<<grid1, block1, smem1, stream.stream()>>>(
+    fa_decode_paged_splitk_kernel<uint8_t, true, false><<<grid1, block1, smem1, stream.stream()>>>(
         (const half*)Q.data_ptr(),
         (const uint8_t*)key_cache.data_ptr(),
         (const uint8_t*)value_cache.data_ptr(),
@@ -2791,7 +2836,8 @@ torch::Tensor fa_rdna2_decode_paged_fp8(
         (float*)L_partial.data_ptr(),
         num_tokens, H_q, H_kv,
         (int)kv_splits, kv_group_num, scale, (int)sliding_window,
-        (float)k_scale, (float)v_scale);
+        (float)k_scale, (float)v_scale,
+        nullptr, nullptr);
   } else {
     constexpr int HEAD_DIM = 256;
     constexpr int THREADS = 256;
@@ -2802,9 +2848,9 @@ torch::Tensor fa_rdna2_decode_paged_fp8(
                  + BC_LOC * sizeof(float)
                  + (THREADS / 32 + 1) * sizeof(float);
     hipFuncSetAttribute(
-        reinterpret_cast<const void*>(fa_decode_paged_splitk_kernel_256<uint8_t, true>),
+        reinterpret_cast<const void*>(fa_decode_paged_splitk_kernel_256<uint8_t, true, false>),
         hipFuncAttributeMaxDynamicSharedMemorySize, smem1);
-    fa_decode_paged_splitk_kernel_256<uint8_t, true><<<grid1, block1, smem1, stream.stream()>>>(
+    fa_decode_paged_splitk_kernel_256<uint8_t, true, false><<<grid1, block1, smem1, stream.stream()>>>(
         (const half*)Q.data_ptr(),
         (const uint8_t*)key_cache.data_ptr(),
         (const uint8_t*)value_cache.data_ptr(),
@@ -2823,7 +2869,8 @@ torch::Tensor fa_rdna2_decode_paged_fp8(
         (float*)L_partial.data_ptr(),
         num_tokens, H_q, H_kv,
         (int)kv_splits, kv_group_num, scale, (int)sliding_window,
-        (float)k_scale, (float)v_scale);
+        (float)k_scale, (float)v_scale,
+        nullptr, nullptr);
   }
   hipError_t err1 = hipGetLastError();
   TORCH_CHECK(err1 == hipSuccess,
@@ -3584,266 +3631,24 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_int8(
 }
 
 
-
 // =====================================================================
-// INT8 PER-TOKEN-HEAD KERNELS (gfx1030, no native int8 dot)
-//
-// RDNA2 has no native int8 matrix dot product. int8 K/V are dequantized
-// to fp16 inside the kernel at the KV load point using per-(token,head)
-// scales. The shared-memory tile stays fp16 so the V_DOT2_F32_F16 QK dot
-// product and the fp32 PV accumulation are unchanged from the fp16 path.
+// INT8 PER-TOKEN-HEAD DECODE HOST WRAPPER
 // =====================================================================
-
-// int8 -> fp16 conversion. Two paths: the value is stored as int8_t but the
-// underlying byte is a signed integer in [-127, 127]. Use the bit-pattern
-// sign-extend: result = (int16_t)(int8_t)byte -> half via __float2half.
-__device__ __forceinline__ half int8_to_half(int8_t val) {
-    return __float2half_rn((float)val);
-}
-
-// Per-element KV load with int8 per-token-head dequant.
-// scale_ptr points to a [num_tokens, H_kv] fp32 scale table; for each
-// (token_idx, head_idx) the scale is scale_ptr[token_idx * H_kv + head_idx].
-__device__ __forceinline__ half fa_kv_load_int8_pth(
-    const int8_t* ptr, const float* scale_ptr,
-    int token_idx, int head_idx, int H_kv) {
-    float s = scale_ptr[token_idx * H_kv + head_idx];
-    return __hmul(int8_to_half(*ptr), __float2half(s));
-}
-
-// ---- DECODE: int8 per-token-head (v3 wiki "live contract") ----
 //
-// The v3 pattern (1 thr/CTA microbench winner, 2.21x fp16 at primary shape):
-//   - 128 threads/CTA (4 wave32). Each thread owns a disjoint D slice of o[].
-//   - QK: each thread reads its 4 i8 bytes from the paged cache (NOT a packed
-//     int load — bytes within a dword span 4 consecutive d_sub values for
-//     the same slot, which are stride_kc2 apart in the 5D paged layout),
-//     fuses i8->fp32 (sign-extend) with per-(token,head) scale, promotes
-//     to half2 pairs, and calls V_DOT2_F32_F16 against its pre-loaded Q slice.
-//   - Warp + block reduce for the scalar QK score.
-//   - Online softmax state (m, l) in shared memory, written by t==0 each iter.
-//   - PV: each thread owns a disjoint D slice, reads its V byte, dequant,
-//     accumulates into o_local[].
-//   - Final write: o_local / l_final -> O_partial.
+// Same shape as fa_rdna2_decode_paged_fp8 but reads int8 K/V cache and
+// dequantizes inline using per-(token, head) fp32 scales. Dispatches the
+// new templated `fa_decode_paged_splitk_kernel<int8_t, false, true>` (D=128)
+// and `fa_decode_paged_splitk_kernel_256<int8_t, false, true>` (D=256) —
+// same shape as the FP8 template (`__launch_bounds__(128/256, 1)`, BC=64/32
+// smem tiles of dequantized fp16 K/V), so the FP8 occupancy-fixed kernel
+// is reused as-is for int8 KV.
 //
-// Compared to the v0 (scalar __hmul dequant over D loop) baseline that
-// preceded this kernel: the new kernel removes the per-element hmul chain
-// (32/64 separate hmul instructions per d) in favour of 4 fdot2
-// (v_dot2c_f32_f16) instructions per dword. On gfx1030 this is ~2x faster
-// at D=256 and ~3x faster at D=128 (v3_128 microbench at D=256 seq=16384
-// measured 89.4x fp16 single-thread). The fused i8->fp32->scale->fp16 VGPR
-// pipeline still wins because it avoids the materialized fp16 KV workspace
-// that v0 needed.
+// Layout expected (matches triton_reshape_and_cache_flash_per_token_head_quant):
+//   key_cache   : [num_blocks, H_kv, D, block_size, 1] int8 (x_dim=1)
+//   value_cache : [num_blocks, H_kv, D, block_size, 1] int8
+//   k_scale     : [num_tokens, H_kv] fp32 — per-(token, head) K scale
+//   v_scale     : [num_tokens, H_kv] fp32 — per-(token, head) V scale
 //
-// Paged addressing: K/V are stored as [num_blocks, H_kv, D, block_size, x=1]
-// (int8 cache with x=1 packing). For each (token, slot), a thread at d_base
-// reads K[d_base * stride_kc2 + slot * stride_kc3]. The 4 bytes in a dword
-// are stride_kc2=block_size apart in memory — they are NOT contiguous, so
-// we issue 4 scalar byte reads rather than a packed int load. The fused
-// i8->fp32->scale->fp16 VGPR pipeline still wins because it avoids the
-// materialized fp16 KV workspace that v0 needed.
-//
-// block_size is hardcoded to 16 (existing limitation preserved — the
-// Python-side int8 cache layout uses block_size=16).
-//
-// Grid: (num_tokens, H_q, kv_splits). Each CTA processes a contiguous chunk
-// of seq_len (real split-K — fixed the existing kernel's bug where every
-// CTA processed the full sweep).
-template <int HEAD_DIM>
-__global__ __launch_bounds__(128, 1) void fa_decode_paged_splitk_kernel_int8_pth(
-    const half* __restrict__ Q,
-    const int8_t* __restrict__ K,
-    const int8_t* __restrict__ V,
-    const int* __restrict__ block_table,
-    const int* __restrict__ seq_lens,
-    int k_stride0, int k_stride1, int k_stride2, int k_stride3, int k_stride4,
-    int v_stride0, int v_stride1, int v_stride2, int v_stride3, int v_stride4,
-    int num_tokens, int H_q, int H_kv, int max_blocks,
-    int kv_group_num, float scale, int sliding_window,
-    const float* __restrict__ k_scale_ptr,
-    const float* __restrict__ v_scale_ptr,
-    float* __restrict__ O_partial,
-    float* __restrict__ M_partial,
-    float* __restrict__ L_partial) {
-
-  constexpr int NTHREADS = 128;
-  constexpr int NWARPS = NTHREADS / 32;
-  constexpr int NDWORDS = HEAD_DIM / 4;
-  constexpr int DWORDS_PER_THREAD = (NDWORDS + NTHREADS - 1) / NTHREADS;
-  constexpr int D_PER_THREAD = (HEAD_DIM + NTHREADS - 1) / NTHREADS;
-  constexpr int BLOCK_SIZE_KV = 16;  // int8 cache block size (hardcoded)
-
-  const int token_idx = blockIdx.x;
-  const int h_q = blockIdx.y;
-  const int split = blockIdx.z;
-  const int t = threadIdx.x;
-  const int lane = t & 31;
-  const int wid = t >> 5;
-  const int h_kv = h_q / kv_group_num;
-  if (token_idx >= num_tokens || h_q >= H_q) return;
-
-  const int seq_len = seq_lens[token_idx];
-  const int* my_block_table = block_table + token_idx * max_blocks;
-  if (seq_len <= 0) {
-    if (t < HEAD_DIM) {
-      O_partial[((token_idx * H_q + h_q) * gridDim.z + split) * HEAD_DIM + t] = 0.0f;
-    }
-    if (t == 0) {
-      M_partial[(token_idx * H_q + h_q) * gridDim.z + split] = -INFINITY;
-      L_partial[(token_idx * H_q + h_q) * gridDim.z + split] = 0.0f;
-    }
-    return;
-  }
-
-  __shared__ float sm_score;
-  __shared__ float sm_m;
-  __shared__ float sm_l;
-  __shared__ float smem_partial[NWARPS];
-
-  // Per-(token, head) K/V scales — the scale depends on the KV position
-  // (n_global), not the query token_idx. We look it up inside the loop
-  // because k_s/v_s change with each KV row. For decode we iterate 1 KV
-  // position at a time so a fresh lookup per iteration is acceptable.
-  // (The pre-existing v0 kernel used token_idx here — that was a bug for
-  // per-token-head quantization; v3 fixes it.)
-
-  // Load Q once per CTA — 2 half2 per dword (covers all 4 fp16 elements).
-  // q_local[i*2+0] = Q[w*4+0..w*4+1], q_local[i*2+1] = Q[w*4+2..w*4+3].
-  half2 q_local[DWORDS_PER_THREAD * 2];
-  #pragma unroll
-  for (int i = 0; i < DWORDS_PER_THREAD; ++i) {
-    const int w = t + i * NTHREADS;
-    if (w < NDWORDS) {
-      q_local[i * 2 + 0] = *reinterpret_cast<const half2*>(&Q[(token_idx * H_q + h_q) * HEAD_DIM + w * 4 + 0]);
-      q_local[i * 2 + 1] = *reinterpret_cast<const half2*>(&Q[(token_idx * H_q + h_q) * HEAD_DIM + w * 4 + 2]);
-    }
-  }
-
-  // Per-thread partial output (D slice).
-  float o_local[D_PER_THREAD];
-  #pragma unroll
-  for (int i = 0; i < D_PER_THREAD; ++i) o_local[i] = 0.0f;
-
-  if (t == 0) {
-    sm_m = -INFINITY;
-    sm_l = 0.0f;
-  }
-  __syncthreads();
-
-  // Split-K: each CTA processes a contiguous chunk of seq_len.
-  const int kv_splits = gridDim.z;
-  const int blocks_per_split = (seq_len + kv_splits - 1) / kv_splits;
-  const int blk_start = split * blocks_per_split;
-  const int blk_end = min(blk_start + blocks_per_split, seq_len);
-
-  for (int n = blk_start; n < blk_end; ++n) {
-    // Decode: 1 token at a time. paged addressing.
-    const int n_global = n;
-    const int block_idx = my_block_table[n_global / BLOCK_SIZE_KV];
-    if (block_idx < 0) continue;
-    const int slot = n_global % BLOCK_SIZE_KV;
-
-    // Per-KV-position scale (per-token-head quantization).
-    const float k_s = k_scale_ptr[n_global * H_kv + h_kv];
-    const float v_s = v_scale_ptr[n_global * H_kv + h_kv];
-
-    // ---- QK ----
-    const int8_t* K_block_base = K + block_idx * k_stride0 + h_kv * k_stride1;
-    float thread_qk = 0.0f;
-    #pragma unroll
-    for (int i = 0; i < DWORDS_PER_THREAD; ++i) {
-      const int w = t + i * NTHREADS;
-      if (w < NDWORDS) {
-        const int d_base = w * 4;
-        // 4 separate byte reads (the bytes within a dword are NOT
-        // contiguous in the 5D paged layout — they are stride_kc2 apart).
-        const int8_t b0 = K_block_base[(d_base + 0) * k_stride2 + slot * k_stride3 + 0];
-        const int8_t b1 = K_block_base[(d_base + 1) * k_stride2 + slot * k_stride3 + 0];
-        const int8_t b2 = K_block_base[(d_base + 2) * k_stride2 + slot * k_stride3 + 0];
-        const int8_t b3 = K_block_base[(d_base + 3) * k_stride2 + slot * k_stride3 + 0];
-        const float kf0 = (float)b0 * k_s;
-        const float kf1 = (float)b1 * k_s;
-        const float kf2 = (float)b2 * k_s;
-        const float kf3 = (float)b3 * k_s;
-        const half2 k01 = __halves2half2(__float2half_rn(kf0), __float2half_rn(kf1));
-        const half2 k23 = __halves2half2(__float2half_rn(kf2), __float2half_rn(kf3));
-        thread_qk = fdot2(q_local[i * 2 + 0], k01, thread_qk);
-        thread_qk = fdot2(q_local[i * 2 + 1], k23, thread_qk);
-      }
-    }
-
-    // Warp reduce over lanes -> warp partial in lane 0.
-    #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-      thread_qk += __shfl_xor(thread_qk, off);
-    }
-    if (lane == 0) smem_partial[wid] = thread_qk;
-    __syncthreads();
-    // Block reduce (NWARPS partials) via warp 0.
-    if (wid == 0) {
-      float v = (lane < NWARPS) ? smem_partial[lane] : 0.0f;
-      #pragma unroll
-      for (int off = (NWARPS / 2); off > 0; off >>= 1) {
-        v += __shfl_xor(v, off);
-      }
-      if (lane == 0) sm_score = v;
-    }
-    __syncthreads();
-    const float score = sm_score * scale;
-
-    // ---- Online softmax update (all threads use global sm_m/sm_l) ----
-    const float m_old = sm_m;
-    const float l_old = sm_l;
-    const float m_new = fmaxf(m_old, score);
-    const float alpha = expf(m_old - m_new);
-    const float p = expf(score - m_new);
-    const float l_new = l_old * alpha + p;
-    if (t == 0) {
-      sm_m = m_new;
-      sm_l = l_new;
-    }
-    __syncthreads();
-
-    // ---- PV: each thread owns a D slice ----
-    const int8_t* V_block_base = V + block_idx * v_stride0 + h_kv * v_stride1;
-    #pragma unroll
-    for (int i = 0; i < D_PER_THREAD; ++i) {
-      const int d = t + i * NTHREADS;
-      if (d < HEAD_DIM) {
-        const int8_t vb = V_block_base[d * v_stride2 + slot * v_stride3 + 0];
-        const float vf = (float)vb * v_s;
-        o_local[i] = o_local[i] * alpha + p * vf;
-      }
-    }
-  }
-
-  // Final write: each thread scales its own D slice by 1/l_final.
-  __syncthreads();
-  const float l_final = sm_l;
-  const int out_off = ((token_idx * H_q + h_q) * gridDim.z + split) * HEAD_DIM;
-  if (l_final > 0.0f) {
-    #pragma unroll
-    for (int i = 0; i < D_PER_THREAD; ++i) {
-      const int d = t + i * NTHREADS;
-      if (d < HEAD_DIM) {
-        O_partial[out_off + d] = o_local[i] / l_final;
-      }
-    }
-  } else {
-    #pragma unroll
-    for (int i = 0; i < D_PER_THREAD; ++i) {
-      const int d = t + i * NTHREADS;
-      if (d < HEAD_DIM) {
-        O_partial[out_off + d] = 0.0f;
-      }
-    }
-  }
-  if (t == 0) {
-    M_partial[(token_idx * H_q + h_q) * gridDim.z + split] = sm_m;
-    L_partial[(token_idx * H_q + h_q) * gridDim.z + split] = sm_l;
-  }
-}
-
 torch::Tensor fa_rdna2_decode_paged_int8(
     torch::Tensor Q,
     torch::Tensor key_cache,
@@ -3872,6 +3677,11 @@ torch::Tensor fa_rdna2_decode_paged_int8(
   const int H_q = Q.size(1);
   const int D = (int)Q.size(2);
   const int H_kv = key_cache.size(1);
+  const int max_blocks = block_table.size(1);
+  const int x_dim = key_cache.size(4);
+  TORCH_CHECK(H_q % H_kv == 0, "H_q must be divisible by H_kv");
+  const int kv_group_num = H_q / H_kv;
+  const float scale = 1.0f / sqrtf((float)D);
 
   auto float_opts = torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
   auto half_opts = torch::TensorOptions().dtype(torch::kHalf).device(Q.device());
@@ -3884,7 +3694,17 @@ torch::Tensor fa_rdna2_decode_paged_int8(
   dim3 grid1(num_tokens, H_q, (int)kv_splits);
 
   if (D == 128) {
-    fa_decode_paged_splitk_kernel_int8_pth<128><<<grid1, 128, 0, stream.stream()>>>(
+    constexpr int HEAD_DIM = 128;
+    constexpr int THREADS = 128;
+    dim3 block1(THREADS);
+    size_t smem1 = HEAD_DIM * sizeof(half)
+                 + BC * HEAD_DIM * sizeof(half) * 2
+                 + BC * sizeof(float)
+                 + (THREADS / 32 + 1) * sizeof(float);
+    hipFuncSetAttribute(
+        reinterpret_cast<const void*>(fa_decode_paged_splitk_kernel<int8_t, false, true>),
+        hipFuncAttributeMaxDynamicSharedMemorySize, smem1);
+    fa_decode_paged_splitk_kernel<int8_t, false, true><<<grid1, block1, smem1, stream.stream()>>>(
         (const half*)Q.data_ptr(),
         (const int8_t*)key_cache.data_ptr(),
         (const int8_t*)value_cache.data_ptr(),
@@ -3892,17 +3712,28 @@ torch::Tensor fa_rdna2_decode_paged_int8(
         (const int*)seq_lens.data_ptr(),
         (int)key_cache.stride(0), (int)key_cache.stride(1),
         (int)key_cache.stride(2), (int)key_cache.stride(3), (int)key_cache.stride(4),
-        (int)value_cache.stride(0), (int)value_cache.stride(1),
-        (int)value_cache.stride(2), (int)value_cache.stride(3), (int)value_cache.stride(4),
-        num_tokens, H_q, H_kv, (int)block_table.size(1),
-        H_q / H_kv, 1.0f / sqrtf((float)D), (int)sliding_window,
+        max_blocks, (int)block_size, x_dim,
+        (float*)O_partial.data_ptr(),
+        (float*)M_partial.data_ptr(),
+        (float*)L_partial.data_ptr(),
+        num_tokens, H_q, H_kv,
+        (int)kv_splits, kv_group_num, scale, (int)sliding_window,
+        0.0f, 0.0f,  // scalar scales unused; IS_INT8 path uses per-tok ptrs
         (const float*)k_scale.data_ptr(),
-        (const float*)v_scale.data_ptr(),
-        O_partial.data_ptr<float>(),
-        M_partial.data_ptr<float>(),
-        L_partial.data_ptr<float>());
+        (const float*)v_scale.data_ptr());
   } else if (D == 256) {
-    fa_decode_paged_splitk_kernel_int8_pth<256><<<grid1, 128, 0, stream.stream()>>>(
+    constexpr int HEAD_DIM = 256;
+    constexpr int THREADS = 256;
+    constexpr int BC_LOC = BC_256;
+    dim3 block1(THREADS);
+    size_t smem1 = HEAD_DIM * sizeof(half)
+                 + BC_LOC * HEAD_DIM * sizeof(half) * 2
+                 + BC_LOC * sizeof(float)
+                 + (THREADS / 32 + 1) * sizeof(float);
+    hipFuncSetAttribute(
+        reinterpret_cast<const void*>(fa_decode_paged_splitk_kernel_256<int8_t, false, true>),
+        hipFuncAttributeMaxDynamicSharedMemorySize, smem1);
+    fa_decode_paged_splitk_kernel_256<int8_t, false, true><<<grid1, block1, smem1, stream.stream()>>>(
         (const half*)Q.data_ptr(),
         (const int8_t*)key_cache.data_ptr(),
         (const int8_t*)value_cache.data_ptr(),
@@ -3910,66 +3741,45 @@ torch::Tensor fa_rdna2_decode_paged_int8(
         (const int*)seq_lens.data_ptr(),
         (int)key_cache.stride(0), (int)key_cache.stride(1),
         (int)key_cache.stride(2), (int)key_cache.stride(3), (int)key_cache.stride(4),
-        (int)value_cache.stride(0), (int)value_cache.stride(1),
-        (int)value_cache.stride(2), (int)value_cache.stride(3), (int)value_cache.stride(4),
-        num_tokens, H_q, H_kv, (int)block_table.size(1),
-        H_q / H_kv, 1.0f / sqrtf((float)D), (int)sliding_window,
+        max_blocks, (int)block_size, x_dim,
+        (float*)O_partial.data_ptr(),
+        (float*)M_partial.data_ptr(),
+        (float*)L_partial.data_ptr(),
+        num_tokens, H_q, H_kv,
+        (int)kv_splits, kv_group_num, scale, (int)sliding_window,
+        0.0f, 0.0f,
         (const float*)k_scale.data_ptr(),
-        (const float*)v_scale.data_ptr(),
-        O_partial.data_ptr<float>(),
-        M_partial.data_ptr<float>(),
-        L_partial.data_ptr<float>());
+        (const float*)v_scale.data_ptr());
   } else {
     TORCH_CHECK(false, "int8 decode: only HEAD_DIM=128 or 256 supported");
   }
 
-  // Stage 2: reduction across splits.
-  // Fast path: when kv_splits=1 (common c=1 decode case), O_partial[:, :, 0, :]
-  // IS the final output -- skip the host-side CPU reduction loop entirely.
-  // This avoids breaking cudagraph capture (the host loop runs outside the
-  // graph and can't sync with the captured async kernel launch).
+  // Stage 2: combine partials across splits.
+  // Fast path: when kv_splits=1, O_partial[:, :, 0, :] IS the final
+  // output — skip the combine kernel launch entirely. This avoids
+  // breaking cudagraph capture (the host loop runs outside the graph
+  // and can't sync with the captured async kernel launch).
   if ((int)kv_splits == 1) {
     hipError_t err = hipGetLastError();
     TORCH_CHECK(err == hipSuccess, "fa_rdna2 int8 decode launch failed: ",
                 hipGetErrorString(err));
     return O_partial.select(2, 0);  // (N, H_q, 1, D) -> (N, H_q, D) view
   }
-  const float* O_p = O_partial.data_ptr<float>();
-  const float* M_p = M_partial.data_ptr<float>();
-  const float* L_p = L_partial.data_ptr<float>();
-  half* O_out = (half*)O.data_ptr();
-  // (Stage-2 reduction is done with the same launcher as fp8; for the
-  // bench workload kv_splits=1 so the reduction is trivial.)
-  // Inline trivial reduction here:
-  for (int t_idx = 0; t_idx < num_tokens; ++t_idx) {
-    for (int h = 0; h < H_q; ++h) {
-      int m_best = -1;
-      float m_max = -INFINITY;
-      for (int sp = 0; sp < (int)kv_splits; ++sp) {
-        float m = M_p[(t_idx * H_q + h) * (int)kv_splits + sp];
-        if (m > m_max) { m_max = m; m_best = sp; }
-      }
-      for (int d = 0; d < D; ++d) {
-        float acc = 0.0f;
-        for (int sp = 0; sp < (int)kv_splits; ++sp) {
-          float m = M_p[(t_idx * H_q + h) * (int)kv_splits + sp];
-          float l = L_p[(t_idx * H_q + h) * (int)kv_splits + sp];
-          float o = O_p[((t_idx * H_q + h) * (int)kv_splits + sp) * D + d];
-          acc += expf(m - m_max) * l * o;
-        }
-        float l_sum = 0.0f;
-        for (int sp = 0; sp < (int)kv_splits; ++sp) {
-          float m = M_p[(t_idx * H_q + h) * (int)kv_splits + sp];
-          float l = L_p[(t_idx * H_q + h) * (int)kv_splits + sp];
-          l_sum += expf(m - m_max) * l;
-        }
-        O_out[(t_idx * H_q + h) * D + d] = __float2half(l_sum > 0.0f ? acc / l_sum : 0.0f);
-      }
-    }
-  }
 
+  dim3 grid2(num_tokens, H_q);
+  dim3 block2(D);
+  size_t smem2 = (3 * (int)kv_splits + 1) * sizeof(float);
+  fa_decode_combine_kernel<<<grid2, block2, smem2, stream.stream()>>>(
+      (const float*)O_partial.data_ptr(),
+      (const float*)M_partial.data_ptr(),
+      (const float*)L_partial.data_ptr(),
+      (half*)O.data_ptr(),
+      num_tokens, H_q, (int)kv_splits, D);
   hipError_t err = hipGetLastError();
-  TORCH_CHECK(err == hipSuccess, "fa_rdna2 int8 decode launch failed: ",
+  TORCH_CHECK(err == hipSuccess, "fa_rdna2 int8 decode combine launch failed: ",
               hipGetErrorString(err));
   return O;
 }
+
+
+
