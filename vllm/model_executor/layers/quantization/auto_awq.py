@@ -309,13 +309,19 @@ class AutoAWQConfig(QuantizationConfig):
             # (Marlin kernels are not batch invariant). gfx10x routes
             # through choose_mp_linear_kernel -> RDNA2W4A16LinearKernel;
             # other ROCm arches keep the Triton AWQ path unchanged.
-            from vllm.platforms.rocm import on_gfx10x
+            # Import on_gfx10x only on ROCm (vllm.platforms.rocm queries
+            # amdsmi at import time; never touch it on CUDA/CPU/XPU).
+            if current_platform.is_rocm():
+                from vllm.platforms.rocm import on_gfx10x
+                rocm_rdna2 = on_gfx10x()
+            else:
+                rocm_rdna2 = False
 
             use_marlin = (
                 not envs.VLLM_BATCH_INVARIANT
                 and (
                     current_platform.is_cuda()
-                    or (current_platform.is_rocm() and on_gfx10x())
+                    or rocm_rdna2
                 )
                 and check_marlin_supported(
                     self.quant_type, self.group_size, self.zero_point
