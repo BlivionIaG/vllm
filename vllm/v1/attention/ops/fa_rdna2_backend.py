@@ -121,6 +121,18 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(torch::Tensor Q,
                                                   int64_t causal,
                                                   int64_t kv_splits,
                                                   int64_t sliding_window);
+torch::Tensor fa_rdna2_prefill_paged_varlen_int8(torch::Tensor Q,
+                                                torch::Tensor key_cache,
+                                                torch::Tensor value_cache,
+                                                torch::Tensor block_table,
+                                                torch::Tensor cu_query_lens,
+                                                torch::Tensor seq_lens,
+                                                int64_t block_size,
+                                                int64_t causal,
+                                                int64_t sliding_window,
+                                                int64_t kv_splits,
+                                                torch::Tensor k_scale,
+                                                torch::Tensor v_scale);
 """
 
     _EXT = load_inline(
@@ -133,7 +145,8 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(torch::Tensor Q,
                    "fa_rdna2_prefill_paged_varlen",
                    "fa_rdna2_prefill_paged_varlen_fp8",
                    "fa_rdna2_prefill_paged_varlen_short",
-                   "fa_rdna2_prefill_paged_varlen_splitk"],
+                   "fa_rdna2_prefill_paged_varlen_splitk",
+                   "fa_rdna2_prefill_paged_varlen_int8"],
         extra_cuda_cflags=["-O3", "--offload-arch=gfx1030"]
                           + _extra_rocm_includes,
         extra_ldflags=_extra_rocm_libdirs,
@@ -372,6 +385,7 @@ def fa_rdna2_prefill_paged_varlen_splitk(Q: torch.Tensor,
                                          seq_lens: torch.Tensor,
                                          block_size: int = 16,
                                          causal: bool = True,
+                                         sliding_window: int = 0,
                                          kv_splits: int = 4) -> torch.Tensor:
     """FA2 paged prefill with split-K varlen for better grid utilization.
 
@@ -400,12 +414,65 @@ def fa_rdna2_prefill_paged_varlen_splitk(Q: torch.Tensor,
         block_size, int(causal), int(kv_splits), sliding_window)
 
 
+def fa_rdna2_prefill_paged_varlen_int8(Q: torch.Tensor,
+                                       key_cache: torch.Tensor,
+                                       value_cache: torch.Tensor,
+                                       block_table: torch.Tensor,
+                                       cu_query_lens: torch.Tensor,
+                                       seq_lens: torch.Tensor,
+                                       block_size: int = 16,
+                                       causal: bool = True,
+                                       sliding_window: int = 0,
+                                       kv_splits: int = 4,
+                                       k_scale: torch.Tensor | None = None,
+                                       v_scale: torch.Tensor | None = None) -> torch.Tensor:
+    """FA2 paged prefill with split-K varlen for int8 per-token-head KV.
+
+    Replaces the Python-side int8 dequant path that used to live in
+    rdna_attn.py. Reads K/V from an int8 per-token-head cache and
+    dequantizes inline using per-(token, head) fp32 scale tables, using
+    the v3 wiki "live contract" ISA pattern (packed int reads from sK,
+    fused i8->fp32->scale->fp16->V_DOT2_F32_F16 against fp16 Q).
+
+    Args:
+        Q: [num_tokens, H_q, D] fp16 query tensor
+        key_cache: [num_blocks, H_kv, D, block_size, 1] int8 paged K cache
+            (x_dim=1 for int8 cache; int8 has no fp16-style packing)
+        value_cache: [num_blocks, H_kv, D, block_size, 1] int8 paged V cache
+        block_table: [num_seqs, max_blocks] int32 per-sequence block indices
+        cu_query_lens: [num_seqs + 1] int32 cumulative query counts
+        seq_lens: [num_seqs] int32 per-sequence KV length
+        block_size: physical block size (must be 16 for the int8 path)
+        causal: whether to apply causal masking (per-sequence)
+        sliding_window: sliding window size (0 = no window)
+        kv_splits: number of KV splits (1..16). 1 = no split.
+        k_scale: [num_tokens, H_kv] fp32 per-(token, head) K scales
+        v_scale: [num_tokens, H_kv] fp32 per-(token, head) V scales
+
+    Returns:
+        O: [num_tokens, H_q, D] fp16 attention output
+    """
+    ext = _load_kernel()
+    if k_scale is None or v_scale is None:
+        raise ValueError(
+            "fa_rdna2_prefill_paged_varlen_int8 requires k_scale/v_scale tensors")
+    if k_scale.dtype != torch.float32:
+        k_scale = k_scale.float()
+    if v_scale.dtype != torch.float32:
+        v_scale = v_scale.float()
+    return ext.fa_rdna2_prefill_paged_varlen_int8(
+        Q, key_cache, value_cache, block_table, cu_query_lens, seq_lens,
+        block_size, int(causal), int(sliding_window), int(kv_splits),
+        k_scale, v_scale)
+
+
 fa_rdna2_decode_paged = torch.compiler.allow_in_graph(fa_rdna2_decode_paged)
 fa_rdna2_decode_paged_fp8 = torch.compiler.allow_in_graph(fa_rdna2_decode_paged_fp8)
 fa_rdna2_prefill_paged_varlen = torch.compiler.allow_in_graph(fa_rdna2_prefill_paged_varlen)
 fa_rdna2_prefill_paged_varlen_fp8 = torch.compiler.allow_in_graph(fa_rdna2_prefill_paged_varlen_fp8)
 fa_rdna2_prefill_paged_varlen_short = torch.compiler.allow_in_graph(fa_rdna2_prefill_paged_varlen_short)
 fa_rdna2_prefill_paged_varlen_splitk = torch.compiler.allow_in_graph(fa_rdna2_prefill_paged_varlen_splitk)
+fa_rdna2_prefill_paged_varlen_int8 = torch.compiler.allow_in_graph(fa_rdna2_prefill_paged_varlen_int8)
 
 
 def fa_rdna2_decode_paged_int8(Q, key_cache, value_cache, block_table, seq_lens,

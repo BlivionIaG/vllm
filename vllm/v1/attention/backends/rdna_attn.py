@@ -54,7 +54,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import ClassVar, Optional
+from typing import Optional
 
 import torch
 
@@ -63,7 +63,6 @@ from vllm.v1.attention.ops.paged_attn import PagedAttention
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
     AttentionBackend,
-    AttentionCGSupport,
     AttentionImpl,
     AttentionLayer,
     AttentionMetadata,
@@ -162,8 +161,6 @@ class RdnaAttentionMetadataBuilder(AttentionMetadataBuilder):
     """V1 metadata builder. Mirrors the chunked-prefill-ish defaults;
     FA-RDNA2 only needs block_table + seq_lens + max_query_len + max_seq_len
     + query_start_loc, all in CommonAttentionMetadata already."""
-
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
@@ -491,24 +488,24 @@ class RdnaAttentionImpl(AttentionImpl):
 
         from vllm.v1.kv_cache_interface import get_kv_quant_mode, KVQuantMode
         _qm_p = get_kv_quant_mode(self.kv_cache_dtype)
-        _int8_prefill = False
         if _qm_p == KVQuantMode.INT8_PER_TOKEN_HEAD:
-            _nb = key_cache.shape[0]
-            _bs = key_cache.shape[3]
-            _k_sc = self._k_scale_tensor.reshape(
-                _nb, _bs, self.num_kv_heads
-            ).transpose(1, 2).unsqueeze(2)
-            _v_sc = self._v_scale_tensor.reshape(
-                _nb, _bs, self.num_kv_heads
-            ).transpose(1, 2).unsqueeze(2)
-            key_cache = (
-                key_cache.squeeze(-1).to(torch.float32) * _k_sc
-            ).to(torch.float16).unsqueeze(-1)
-            value_cache = (
-                value_cache.squeeze(-1).to(torch.float32) * _v_sc
-            ).to(torch.float16).unsqueeze(-1)
-            _int8_prefill = True
-        if not _int8_prefill and is_quantized_kv_cache(self.kv_cache_dtype):
+            # Native int8 prefill — dequant happens inline in the kernel,
+            # no Python-side fp16 conversion of the whole KV cache.
+            out_paged_prefill = fa.fa_rdna2_prefill_paged_varlen_int8(
+                query[:num_actual_tokens],
+                key_cache,
+                value_cache,
+                block_table,
+                cu_seqlens_q,
+                seqused_k,
+                paged_block_size,
+                causal=causal,
+                sliding_window=sliding_window,
+                kv_splits=_kv_splits,
+                k_scale=self._k_scale_tensor,
+                v_scale=self._v_scale_tensor,
+            )
+        elif is_quantized_kv_cache(self.kv_cache_dtype):
             out_paged_prefill = fa.fa_rdna2_prefill_paged_varlen_fp8(
                 query[:num_actual_tokens],
                 key_cache,

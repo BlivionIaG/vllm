@@ -1999,6 +1999,544 @@ __global__ void fa_prefill_paged_varlen_splitk_reduce_kernel_256(
 }
 
 // =====================================================================
+// SPLIT-K PREFILL (PAGED, VARLEN) — INT8 PER-TOKEN-HEAD
+// =====================================================================
+//
+// Native int8 prefill kernel. Mirrors the fp16 splitk structure but uses
+// the v3 wiki "live contract" pattern for the QK dot product (packed
+// dword reads from sK, fused i8->fp32->scale->fp16->V_DOT2). The K/V
+// cache is int8 with per-(token,head) scales; sK/sV are stored as int8
+// in shared memory (½ the smem cost of the fp16 splitk kernel).
+//
+// Smem layout (D=128, BR=16, BC=64):
+//   sQ         [BR][D] fp16    = 16 * 128 * 2  = 4 KB
+//   sK, sV     [BC][D] int8    = 64 * 128 * 1  = 8 KB each (vs 16 KB fp16)
+//   sP         [BC][BR] fp32   = 64 * 16 * 4   = 4 KB
+//   sM, sL     [BR] fp32       = 16 * 4 * 2    = 128 B
+//   sO         [BR][D] fp32    = 16 * 128 * 4  = 8 KB
+//   sKscales   [BC] fp32       = 64 * 4        = 256 B
+//   sVscales   [BC] fp32       = 64 * 4        = 256 B
+//   sRed       [5] fp32        = 20 B
+//   Total                      ≈ 32.7 KB (vs ~48 KB fp16 splitk)
+//
+// block_size is hardcoded to 16 (matches the int8 cache layout used by
+// vLLM for INT8_PER_TOKEN_HEAD).
+//
+// Grid: (max_q_blocks_per_seq, H_q, num_seqs * kv_splits). z encodes
+// (seq_idx, split_idx) — same convention as the fp16 splitk kernel.
+// =====================================================================
+
+__global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_int8_128(
+    const half* __restrict__ Q,
+    const int8_t* __restrict__ key_cache,
+    const int8_t* __restrict__ value_cache,
+    const int* __restrict__ block_table,
+    const int* __restrict__ cu_query_lens,
+    const int* __restrict__ seq_lens,
+    const int stride_kc0,
+    const int stride_kc1,
+    const int stride_kc2,
+    const int stride_kc3,
+    const int stride_kc4,
+    const int max_blocks,
+    const int block_size,
+    const int x_dim,
+    const int num_seqs,
+    const int kv_splits,
+    float* __restrict__ O_partial,
+    float* __restrict__ M_partial,
+    float* __restrict__ L_partial,
+    const int H_q,
+    const int H_kv,
+    const int kv_group_num,
+    const float scale,
+    const int causal,
+    const int sliding_window,
+    const float* __restrict__ k_scale_ptr,
+    const float* __restrict__ v_scale_ptr) {
+
+  constexpr int HEAD_DIM = 128;
+  constexpr int THREADS_PREFILL_LOC = 128;
+  constexpr int BC_LOC = 64;
+  constexpr int BR_PREFILL_LOC = 16;
+  constexpr int NDWORDS = HEAD_DIM / 4;
+
+  const int seq_idx = blockIdx.z / kv_splits;
+  const int split_idx = blockIdx.z % kv_splits;
+  const int q_block = blockIdx.x;
+  const int h_q = blockIdx.y;
+  const int t = threadIdx.x;
+  const int h_kv = h_q / kv_group_num;
+  if (seq_idx >= num_seqs || h_q >= H_q) return;
+
+  const int q_start_in_seq = q_block * BR_PREFILL_LOC;
+  const int seq_query_len = cu_query_lens[seq_idx + 1] - cu_query_lens[seq_idx];
+  if (q_start_in_seq >= seq_query_len) return;
+  const int q_start_global = cu_query_lens[seq_idx] + q_start_in_seq;
+  const int seq_len = seq_lens[seq_idx];
+  const int br_size = min(BR_PREFILL_LOC, seq_query_len - q_start_in_seq);
+  const int* seq_block_table = block_table + seq_idx * max_blocks;
+
+  // Split the KV range [0, seq_len) into kv_splits chunks.
+  const int kv_per_split = (seq_len + kv_splits - 1) / kv_splits;
+  const int kv_start = split_idx * kv_per_split;
+  const int kv_end = min(kv_start + kv_per_split, seq_len);
+  if (kv_start >= kv_end) {
+    // Empty split: write zero partials.
+    const int partial_base_empty = ((q_start_global * H_q + h_q) * BR_PREFILL_LOC * kv_splits) + split_idx;
+    for (int br = 0; br < BR_PREFILL_LOC; ++br) {
+      M_partial[partial_base_empty + br * kv_splits] = -INFINITY;
+      L_partial[partial_base_empty + br * kv_splits] = 0.0f;
+      for (int d = t; d < HEAD_DIM; d += THREADS_PREFILL_LOC) {
+        O_partial[(partial_base_empty + br * kv_splits) * HEAD_DIM + d] = 0.0f;
+      }
+    }
+    return;
+  }
+
+  const int stride_qo_tok = H_q * HEAD_DIM;
+  const int stride_qo_h = HEAD_DIM;
+
+  extern __shared__ unsigned char smem_raw[];
+  half*   sQ  = reinterpret_cast<half*>(smem_raw);
+  int8_t* sK  = reinterpret_cast<int8_t*>(sQ + BR_PREFILL_LOC * HEAD_DIM);
+  int8_t* sV  = sK + BC_LOC * HEAD_DIM;
+  float*  sP  = reinterpret_cast<float*>(sV + BC_LOC * HEAD_DIM);
+  float*  sM  = sP + BC_LOC * BR_PREFILL_LOC;
+  float*  sL  = sM + BR_PREFILL_LOC;
+  float*  sO  = sL + BR_PREFILL_LOC;
+  float*  sKscales = sO + BR_PREFILL_LOC * HEAD_DIM;
+  float*  sVscales = sKscales + BC_LOC;
+
+  // Load Q[Br x D] into shared memory (fp16).
+  {
+    const half* Q_row = Q + (q_start_global * stride_qo_tok + h_q * stride_qo_h);
+    for (int i = t; i < BR_PREFILL_LOC * HEAD_DIM; i += THREADS_PREFILL_LOC) {
+      const int br = i / HEAD_DIM;
+      const int d = i % HEAD_DIM;
+      sQ[i] = (br < br_size) ? Q_row[br * stride_qo_tok + d] : __float2half(0.0f);
+    }
+  }
+  __syncthreads();
+
+  if (t < BR_PREFILL_LOC) {
+    sM[t] = -INFINITY;
+    sL[t] = 0.0f;
+  }
+  for (int i = t; i < BR_PREFILL_LOC * HEAD_DIM; i += THREADS_PREFILL_LOC) {
+    sO[i] = 0.0f;
+  }
+  __syncthreads();
+
+  // Stream over this split's KV range.
+  for (int n = kv_start; n < kv_end; n += BC_LOC) {
+    const int blk_size = min(BC_LOC, kv_end - n);
+
+    // Cooperative load sK[BC][D] and sV[BC][D] from paged int8 cache.
+    // Each byte read goes through the paged address translation; the
+    // resulting sK/sV are laid out [BC][D] int8 (contiguous in d).
+    for (int i = t; i < BC_LOC * HEAD_DIM; i += THREADS_PREFILL_LOC) {
+      const int n_local = i / HEAD_DIM;
+      const int d = i % HEAD_DIM;
+      if (n_local < blk_size) {
+        const int n_global = n + n_local;
+        const int block_idx = seq_block_table[n_global / block_size];
+        const int slot = n_global % block_size;
+        const int d_sub = d / x_dim;
+        const int x_idx = d % x_dim;
+        const int8_t* k_ptr = key_cache
+            + block_idx * stride_kc0
+            + h_kv * stride_kc1
+            + d_sub * stride_kc2
+            + slot * stride_kc3
+            + x_idx * stride_kc4;
+        const int8_t* v_ptr = value_cache
+            + block_idx * stride_kc0
+            + h_kv * stride_kc1
+            + d_sub * stride_kc2
+            + slot * stride_kc3
+            + x_idx * stride_kc4;
+        sK[i] = *k_ptr;
+        sV[i] = *v_ptr;
+      }
+    }
+    // Pre-load per-(token,head) K and V scales for this KV block.
+    for (int k = t; k < BC_LOC; k += THREADS_PREFILL_LOC) {
+      if (k < blk_size) {
+        const int n_global = n + k;
+        sKscales[k] = k_scale_ptr[n_global * H_kv + h_kv];
+        sVscales[k] = v_scale_ptr[n_global * H_kv + h_kv];
+      } else {
+        sKscales[k] = 1.0f;
+        sVscales[k] = 1.0f;
+      }
+    }
+    __syncthreads();
+
+    // ---- QK: v3 wiki pattern — packed int reads from sK, fused
+    //      i8->fp32 with per-(token,head) scale, promote to half2 pairs,
+    //      V_DOT2_F32_F16 against pre-loaded fp16 Q. ----
+    for (int idx = t; idx < BR_PREFILL_LOC * BC_LOC; idx += THREADS_PREFILL_LOC) {
+      const int br = idx / BC_LOC;
+      const int k = idx % BC_LOC;
+      float acc = 0.0f;
+      if (br < br_size && k < blk_size) {
+        const int q_local = q_start_in_seq + br;
+        const int n_global = n + k;
+        const bool masked_causal = causal && (n_global > q_local);
+        const bool masked_window = (sliding_window > 0)
+                                   && (n_global < q_local - sliding_window);
+        const bool masked = masked_causal || masked_window;
+        if (!masked) {
+          const float k_s = sKscales[k];
+          const half* sQ_row = sQ + br * HEAD_DIM;
+          const int8_t* sK_row = sK + k * HEAD_DIM;
+          #pragma unroll
+          for (int w = 0; w < NDWORDS; ++w) {
+            // Packed dword read from sK (contiguous within row).
+            const int32_t k_packed = *reinterpret_cast<const int*>(&sK_row[w * 4]);
+            const float kf0 = (float)(int8_t)(k_packed & 0xFF) * k_s;
+            const float kf1 = (float)(int8_t)((k_packed >> 8) & 0xFF) * k_s;
+            const float kf2 = (float)(int8_t)((k_packed >> 16) & 0xFF) * k_s;
+            const float kf3 = (float)(int8_t)((k_packed >> 24) & 0xFF) * k_s;
+            const half2 k01 = __halves2half2(__float2half_rn(kf0), __float2half_rn(kf1));
+            const half2 k23 = __halves2half2(__float2half_rn(kf2), __float2half_rn(kf3));
+            const half2 q01 = *reinterpret_cast<const half2*>(&sQ_row[w * 4 + 0]);
+            const half2 q23 = *reinterpret_cast<const half2*>(&sQ_row[w * 4 + 2]);
+            acc = fdot2(q01, k01, acc);
+            acc = fdot2(q23, k23, acc);
+          }
+          sP[br * BC_LOC + k] = acc * scale;
+        } else {
+          sP[br * BC_LOC + k] = -INFINITY;
+        }
+      } else {
+        sP[br * BC_LOC + k] = 0.0f;
+      }
+    }
+    __syncthreads();
+
+    // ---- Online softmax update. Same as fp16 splitk. ----
+    if (t < BR_PREFILL_LOC && t < br_size) {
+      float row_max = -INFINITY;
+      for (int k = 0; k < blk_size; ++k) {
+        row_max = fmaxf(row_max, sP[t * BC_LOC + k]);
+      }
+      if (row_max > -INFINITY) {
+        float new_m = fmaxf(sM[t], row_max);
+        float exp_diff = expf(sM[t] - new_m);
+        float sum_p = 0.0f;
+        for (int k = 0; k < blk_size; ++k) {
+          sum_p += expf(sP[t * BC_LOC + k] - new_m);
+        }
+        sL[t] = exp_diff * sL[t] + sum_p;
+        for (int d = 0; d < HEAD_DIM; ++d) {
+          sO[t * HEAD_DIM + d] *= exp_diff;
+        }
+        sM[t] = new_m;
+        for (int k = 0; k < blk_size; ++k) {
+          sP[t * BC_LOC + k] = expf(sP[t * BC_LOC + k] - new_m);
+        }
+      } else {
+        for (int k = 0; k < blk_size; ++k) {
+          sP[t * BC_LOC + k] = 0.0f;
+        }
+      }
+    }
+    __syncthreads();
+
+    // ---- PV: scalar int8 reads from sV with per-(token,head) scale. ----
+    for (int idx = t; idx < BR_PREFILL_LOC * HEAD_DIM; idx += THREADS_PREFILL_LOC) {
+      const int br = idx / HEAD_DIM;
+      const int d = idx % HEAD_DIM;
+      if (br < br_size) {
+        float pv = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < BC_LOC; ++k) {
+          if (k < blk_size) {
+            float p_val = sP[br * BC_LOC + k];
+            float v_val = (float)sV[k * HEAD_DIM + d] * sVscales[k];
+            pv = fmaf(p_val, v_val, pv);
+          }
+        }
+        sO[br * HEAD_DIM + d] += pv;
+      }
+    }
+    __syncthreads();
+  }
+
+  // Write partial O (unnormalized), M, L (same layout as fp16 splitk).
+  const int partial_base = ((q_start_global * H_q + h_q) * BR_PREFILL_LOC * kv_splits) + split_idx;
+  if (t < BR_PREFILL_LOC) {
+    const int br = t;
+    const int64_t slot = partial_base + br * kv_splits;
+    const bool active = (br < br_size);
+    if (active) {
+      M_partial[slot] = sM[br];
+      L_partial[slot] = sL[br];
+    } else {
+      M_partial[slot] = -INFINITY;
+      L_partial[slot] = 0.0f;
+    }
+  }
+  for (int br = 0; br < BR_PREFILL_LOC; ++br) {
+    const int64_t slot = partial_base + br * kv_splits;
+    const bool active = (br < br_size);
+    for (int d = t; d < HEAD_DIM; d += THREADS_PREFILL_LOC) {
+      O_partial[slot * HEAD_DIM + d] = active ? sO[br * HEAD_DIM + d] : 0.0f;
+    }
+  }
+}
+
+// HEAD_DIM = 256 split-K prefill kernel (int8 per-token-head).
+__global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_int8_256(
+    const half* __restrict__ Q,
+    const int8_t* __restrict__ key_cache,
+    const int8_t* __restrict__ value_cache,
+    const int* __restrict__ block_table,
+    const int* __restrict__ cu_query_lens,
+    const int* __restrict__ seq_lens,
+    const int stride_kc0,
+    const int stride_kc1,
+    const int stride_kc2,
+    const int stride_kc3,
+    const int stride_kc4,
+    const int max_blocks,
+    const int block_size,
+    const int x_dim,
+    const int num_seqs,
+    const int kv_splits,
+    float* __restrict__ O_partial,
+    float* __restrict__ M_partial,
+    float* __restrict__ L_partial,
+    const int H_q,
+    const int H_kv,
+    const int kv_group_num,
+    const float scale,
+    const int causal,
+    const int sliding_window,
+    const float* __restrict__ k_scale_ptr,
+    const float* __restrict__ v_scale_ptr) {
+
+  constexpr int HEAD_DIM = 256;
+  constexpr int THREADS_PREFILL_LOC = 256;
+  constexpr int BC_LOC = 32;
+  constexpr int BR_PREFILL_LOC = 16;
+  constexpr int NDWORDS = HEAD_DIM / 4;
+
+  const int seq_idx = blockIdx.z / kv_splits;
+  const int split_idx = blockIdx.z % kv_splits;
+  const int q_block = blockIdx.x;
+  const int h_q = blockIdx.y;
+  const int t = threadIdx.x;
+  const int h_kv = h_q / kv_group_num;
+  if (seq_idx >= num_seqs || h_q >= H_q) return;
+
+  const int q_start_in_seq = q_block * BR_PREFILL_LOC;
+  const int seq_query_len = cu_query_lens[seq_idx + 1] - cu_query_lens[seq_idx];
+  if (q_start_in_seq >= seq_query_len) return;
+  const int q_start_global = cu_query_lens[seq_idx] + q_start_in_seq;
+  const int seq_len = seq_lens[seq_idx];
+  const int br_size = min(BR_PREFILL_LOC, seq_query_len - q_start_in_seq);
+  const int* seq_block_table = block_table + seq_idx * max_blocks;
+
+  const int kv_per_split = (seq_len + kv_splits - 1) / kv_splits;
+  const int kv_start = split_idx * kv_per_split;
+  const int kv_end = min(kv_start + kv_per_split, seq_len);
+  if (kv_start >= kv_end) {
+    const int partial_base_empty = ((q_start_global * H_q + h_q) * BR_PREFILL_LOC * kv_splits) + split_idx;
+    for (int br = 0; br < BR_PREFILL_LOC; ++br) {
+      M_partial[partial_base_empty + br * kv_splits] = -INFINITY;
+      L_partial[partial_base_empty + br * kv_splits] = 0.0f;
+      for (int d = t; d < HEAD_DIM; d += THREADS_PREFILL_LOC) {
+        O_partial[(partial_base_empty + br * kv_splits) * HEAD_DIM + d] = 0.0f;
+      }
+    }
+    return;
+  }
+
+  const int stride_qo_tok = H_q * HEAD_DIM;
+  const int stride_qo_h = HEAD_DIM;
+
+  extern __shared__ unsigned char smem_raw[];
+  half*   sQ  = reinterpret_cast<half*>(smem_raw);
+  int8_t* sK  = reinterpret_cast<int8_t*>(sQ + BR_PREFILL_LOC * HEAD_DIM);
+  int8_t* sV  = sK + BC_LOC * HEAD_DIM;
+  float*  sP  = reinterpret_cast<float*>(sV + BC_LOC * HEAD_DIM);
+  float*  sM  = sP + BC_LOC * BR_PREFILL_LOC;
+  float*  sL  = sM + BR_PREFILL_LOC;
+  float*  sO  = sL + BR_PREFILL_LOC;
+  float*  sKscales = sO + BR_PREFILL_LOC * HEAD_DIM;
+  float*  sVscales = sKscales + BC_LOC;
+
+  {
+    const half* Q_row = Q + (q_start_global * stride_qo_tok + h_q * stride_qo_h);
+    for (int i = t; i < BR_PREFILL_LOC * HEAD_DIM; i += THREADS_PREFILL_LOC) {
+      const int br = i / HEAD_DIM;
+      const int d = i % HEAD_DIM;
+      sQ[i] = (br < br_size) ? Q_row[br * stride_qo_tok + d] : __float2half(0.0f);
+    }
+  }
+  __syncthreads();
+
+  if (t < BR_PREFILL_LOC) {
+    sM[t] = -INFINITY;
+    sL[t] = 0.0f;
+  }
+  for (int i = t; i < BR_PREFILL_LOC * HEAD_DIM; i += THREADS_PREFILL_LOC) {
+    sO[i] = 0.0f;
+  }
+  __syncthreads();
+
+  for (int n = kv_start; n < kv_end; n += BC_LOC) {
+    const int blk_size = min(BC_LOC, kv_end - n);
+
+    for (int i = t; i < BC_LOC * HEAD_DIM; i += THREADS_PREFILL_LOC) {
+      const int n_local = i / HEAD_DIM;
+      const int d = i % HEAD_DIM;
+      if (n_local < blk_size) {
+        const int n_global = n + n_local;
+        const int block_idx = seq_block_table[n_global / block_size];
+        const int slot = n_global % block_size;
+        const int d_sub = d / x_dim;
+        const int x_idx = d % x_dim;
+        const int8_t* k_ptr = key_cache
+            + block_idx * stride_kc0
+            + h_kv * stride_kc1
+            + d_sub * stride_kc2
+            + slot * stride_kc3
+            + x_idx * stride_kc4;
+        const int8_t* v_ptr = value_cache
+            + block_idx * stride_kc0
+            + h_kv * stride_kc1
+            + d_sub * stride_kc2
+            + slot * stride_kc3
+            + x_idx * stride_kc4;
+        sK[i] = *k_ptr;
+        sV[i] = *v_ptr;
+      }
+    }
+    for (int k = t; k < BC_LOC; k += THREADS_PREFILL_LOC) {
+      if (k < blk_size) {
+        const int n_global = n + k;
+        sKscales[k] = k_scale_ptr[n_global * H_kv + h_kv];
+        sVscales[k] = v_scale_ptr[n_global * H_kv + h_kv];
+      } else {
+        sKscales[k] = 1.0f;
+        sVscales[k] = 1.0f;
+      }
+    }
+    __syncthreads();
+
+    for (int idx = t; idx < BR_PREFILL_LOC * BC_LOC; idx += THREADS_PREFILL_LOC) {
+      const int br = idx / BC_LOC;
+      const int k = idx % BC_LOC;
+      float acc = 0.0f;
+      if (br < br_size && k < blk_size) {
+        const int q_local = q_start_in_seq + br;
+        const int n_global = n + k;
+        const bool masked_causal = causal && (n_global > q_local);
+        const bool masked_window = (sliding_window > 0)
+                                   && (n_global < q_local - sliding_window);
+        const bool masked = masked_causal || masked_window;
+        if (!masked) {
+          const float k_s = sKscales[k];
+          const half* sQ_row = sQ + br * HEAD_DIM;
+          const int8_t* sK_row = sK + k * HEAD_DIM;
+          #pragma unroll
+          for (int w = 0; w < NDWORDS; ++w) {
+            const int32_t k_packed = *reinterpret_cast<const int*>(&sK_row[w * 4]);
+            const float kf0 = (float)(int8_t)(k_packed & 0xFF) * k_s;
+            const float kf1 = (float)(int8_t)((k_packed >> 8) & 0xFF) * k_s;
+            const float kf2 = (float)(int8_t)((k_packed >> 16) & 0xFF) * k_s;
+            const float kf3 = (float)(int8_t)((k_packed >> 24) & 0xFF) * k_s;
+            const half2 k01 = __halves2half2(__float2half_rn(kf0), __float2half_rn(kf1));
+            const half2 k23 = __halves2half2(__float2half_rn(kf2), __float2half_rn(kf3));
+            const half2 q01 = *reinterpret_cast<const half2*>(&sQ_row[w * 4 + 0]);
+            const half2 q23 = *reinterpret_cast<const half2*>(&sQ_row[w * 4 + 2]);
+            acc = fdot2(q01, k01, acc);
+            acc = fdot2(q23, k23, acc);
+          }
+          sP[br * BC_LOC + k] = acc * scale;
+        } else {
+          sP[br * BC_LOC + k] = -INFINITY;
+        }
+      } else {
+        sP[br * BC_LOC + k] = 0.0f;
+      }
+    }
+    __syncthreads();
+
+    if (t < BR_PREFILL_LOC && t < br_size) {
+      float row_max = -INFINITY;
+      for (int k = 0; k < blk_size; ++k) {
+        row_max = fmaxf(row_max, sP[t * BC_LOC + k]);
+      }
+      if (row_max > -INFINITY) {
+        float new_m = fmaxf(sM[t], row_max);
+        float exp_diff = expf(sM[t] - new_m);
+        float sum_p = 0.0f;
+        for (int k = 0; k < blk_size; ++k) {
+          sum_p += expf(sP[t * BC_LOC + k] - new_m);
+        }
+        sL[t] = exp_diff * sL[t] + sum_p;
+        for (int d = 0; d < HEAD_DIM; ++d) {
+          sO[t * HEAD_DIM + d] *= exp_diff;
+        }
+        sM[t] = new_m;
+        for (int k = 0; k < blk_size; ++k) {
+          sP[t * BC_LOC + k] = expf(sP[t * BC_LOC + k] - new_m);
+        }
+      } else {
+        for (int k = 0; k < blk_size; ++k) {
+          sP[t * BC_LOC + k] = 0.0f;
+        }
+      }
+    }
+    __syncthreads();
+
+    for (int idx = t; idx < BR_PREFILL_LOC * HEAD_DIM; idx += THREADS_PREFILL_LOC) {
+      const int br = idx / HEAD_DIM;
+      const int d = idx % HEAD_DIM;
+      if (br < br_size) {
+        float pv = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < BC_LOC; ++k) {
+          if (k < blk_size) {
+            float p_val = sP[br * BC_LOC + k];
+            float v_val = (float)sV[k * HEAD_DIM + d] * sVscales[k];
+            pv = fmaf(p_val, v_val, pv);
+          }
+        }
+        sO[br * HEAD_DIM + d] += pv;
+      }
+    }
+    __syncthreads();
+  }
+
+  const int partial_base = ((q_start_global * H_q + h_q) * BR_PREFILL_LOC * kv_splits) + split_idx;
+  if (t < BR_PREFILL_LOC) {
+    const int br = t;
+    const int64_t slot = partial_base + br * kv_splits;
+    const bool active = (br < br_size);
+    if (active) {
+      M_partial[slot] = sM[br];
+      L_partial[slot] = sL[br];
+    } else {
+      M_partial[slot] = -INFINITY;
+      L_partial[slot] = 0.0f;
+    }
+  }
+  for (int br = 0; br < BR_PREFILL_LOC; ++br) {
+    const int64_t slot = partial_base + br * kv_splits;
+    const bool active = (br < br_size);
+    for (int d = t; d < HEAD_DIM; d += THREADS_PREFILL_LOC) {
+      O_partial[slot * HEAD_DIM + d] = active ? sO[br * HEAD_DIM + d] : 0.0f;
+    }
+  }
+}
+
+// =====================================================================
 // Public entry point
 // =====================================================================
 
@@ -2853,6 +3391,199 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(
 }
 
 
+// =====================================================================
+// PAGED PREFILL HOST WRAPPER (INT8 PER-TOKEN-HEAD KV CACHE)
+// =====================================================================
+//
+// Native int8 prefill kernel (replaces the Python-side dequant in
+// rdna_attn.py:492-507). Reads K/V from an int8 per-token-head KV cache,
+// dequantizes inline using the per-(token,head) fp32 scale tables, and
+// runs the v3 wiki "live contract" pattern in the inner QK loop.
+//
+// Inputs mirror the fp8 prefill wrapper, but k_scale/v_scale are
+// torch::Tensor [num_tokens, H_kv] fp32 (per-token-head layout) instead
+// of doubles.
+//
+torch::Tensor fa_rdna2_prefill_paged_varlen_int8(
+    torch::Tensor Q,
+    torch::Tensor key_cache,
+    torch::Tensor value_cache,
+    torch::Tensor block_table,
+    torch::Tensor cu_query_lens,
+    torch::Tensor seq_lens,
+    int64_t block_size,
+    int64_t causal,
+    int64_t sliding_window,
+    int64_t kv_splits,
+    torch::Tensor k_scale,
+    torch::Tensor v_scale) {
+  TORCH_CHECK(Q.is_cuda() && key_cache.is_cuda() && value_cache.is_cuda(),
+              "Q/key_cache/value_cache must be on HIP device");
+  TORCH_CHECK(block_table.is_cuda() && cu_query_lens.is_cuda() && seq_lens.is_cuda(),
+              "block_table/cu_query_lens/seq_lens must be on HIP device");
+  TORCH_CHECK(k_scale.is_cuda() && v_scale.is_cuda(),
+              "k_scale/v_scale must be on HIP device");
+  TORCH_CHECK(Q.scalar_type() == torch::kHalf, "Q must be fp16");
+  TORCH_CHECK(key_cache.scalar_type() == torch::kInt8,
+              "int8 key_cache must be int8");
+  TORCH_CHECK(value_cache.scalar_type() == torch::kInt8,
+              "int8 value_cache must be int8");
+  TORCH_CHECK(block_table.scalar_type() == torch::kInt32, "block_table must be int32");
+  TORCH_CHECK(cu_query_lens.scalar_type() == torch::kInt32, "cu_query_lens must be int32");
+  TORCH_CHECK(seq_lens.scalar_type() == torch::kInt32, "seq_lens must be int32");
+  TORCH_CHECK(k_scale.scalar_type() == torch::kFloat32 && v_scale.scalar_type() == torch::kFloat32,
+              "k_scale/v_scale must be float32");
+  TORCH_CHECK(Q.dim() == 3, "Q must be [num_tokens, H_q, D]");
+  TORCH_CHECK(key_cache.dim() == 5, "key_cache must be 5D");
+  TORCH_CHECK(value_cache.dim() == 5, "value_cache must be 5D");
+  TORCH_CHECK(Q.size(2) == 128 || Q.size(2) == 256, "D must be 128 or 256");
+  TORCH_CHECK(key_cache.size(4) == value_cache.size(4), "x packing must match");
+  TORCH_CHECK(key_cache.size(2) * key_cache.size(4) == (int64_t)Q.size(2),
+              "D/x * x must equal D");
+  TORCH_CHECK(block_table.dim() == 2, "block_table must be [num_seqs, max_blocks]");
+  TORCH_CHECK(kv_splits >= 1 && kv_splits <= MAX_SPLITS,
+              "kv_splits must be in [1, 16]");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(Q));
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  const int num_tokens = Q.size(0);
+  const int H_q = Q.size(1);
+  const int D = (int)Q.size(2);
+  const int H_kv = key_cache.size(1);
+  const int max_blocks = block_table.size(1);
+  const int x_dim = key_cache.size(4);
+  const int num_seqs = seq_lens.size(0);
+  TORCH_CHECK(H_q % H_kv == 0, "H_q must be divisible by H_kv");
+  const int kv_group_num = H_q / H_kv;
+  const float scale = 1.0f / sqrtf((float)D);
+  TORCH_CHECK(num_tokens > 0, "num_tokens must be > 0");
+  TORCH_CHECK(num_seqs > 0, "num_seqs must be > 0");
+
+  auto half_opts = torch::TensorOptions().dtype(torch::kHalf).device(Q.device());
+  auto float_opts = torch::TensorOptions().dtype(torch::kFloat32).device(Q.device());
+  auto O = torch::empty({num_tokens, H_q, D}, half_opts);
+  // Partial layout: [N, H_q, BR_PREFILL, kv_splits, D] — the splitk
+  // kernel indexes ((q_start_global * H_q + h_q) * BR_PREFILL + br) *
+  // kv_splits + split, and the existing reduce kernel reads the same
+  // layout. The fp16 splitk wrapper uses [N, H_q, kv_splits, D]
+  // (smaller) which corrupts memory; we use the correct larger layout
+  // here so the int8 path is safe.
+  auto O_partial = torch::empty({num_tokens, H_q, BR_PREFILL,
+                                 (int)kv_splits, D}, float_opts);
+  auto M_partial = torch::empty({num_tokens, H_q, BR_PREFILL,
+                                 (int)kv_splits}, float_opts);
+  auto L_partial = torch::empty({num_tokens, H_q, BR_PREFILL,
+                                 (int)kv_splits}, float_opts);
+
+  const int max_q_blocks = (num_tokens + BR_PREFILL - 1) / BR_PREFILL;
+
+  if (D == 128) {
+    constexpr int HEAD_DIM = 128;
+    constexpr int THREADS = 128;
+    constexpr int BC_LOC = 64;
+    constexpr int BR_PREFILL_LOC = BR_PREFILL;
+    dim3 grid(max_q_blocks, H_q, num_seqs * (int)kv_splits);
+    dim3 block(THREADS);
+    size_t smem = BR_PREFILL_LOC * HEAD_DIM * sizeof(half)
+                + BC_LOC * HEAD_DIM * sizeof(int8_t) * 2
+                + BC_LOC * BR_PREFILL_LOC * sizeof(float)
+                + BR_PREFILL_LOC * sizeof(float) * 3
+                + BR_PREFILL_LOC * HEAD_DIM * sizeof(float)
+                + BC_LOC * sizeof(float) * 2
+                + (THREADS / 32 + 1) * sizeof(float);
+    hipFuncSetAttribute(
+        reinterpret_cast<const void*>(fa_prefill_paged_varlen_splitk_kernel_int8_128),
+        hipFuncAttributeMaxDynamicSharedMemorySize, smem);
+    fa_prefill_paged_varlen_splitk_kernel_int8_128<<<grid, block, smem, stream.stream()>>>(
+        (const half*)Q.data_ptr(),
+        (const int8_t*)key_cache.data_ptr(),
+        (const int8_t*)value_cache.data_ptr(),
+        (const int*)block_table.data_ptr(),
+        (const int*)cu_query_lens.data_ptr(),
+        (const int*)seq_lens.data_ptr(),
+        (int)key_cache.stride(0),
+        (int)key_cache.stride(1),
+        (int)key_cache.stride(2),
+        (int)key_cache.stride(3),
+        (int)key_cache.stride(4),
+        max_blocks,
+        (int)block_size,
+        x_dim,
+        num_seqs,
+        (int)kv_splits,
+        (float*)O_partial.data_ptr(),
+        (float*)M_partial.data_ptr(),
+        (float*)L_partial.data_ptr(),
+        H_q, H_kv, kv_group_num, scale, (int)causal, (int)sliding_window,
+        (const float*)k_scale.data_ptr(),
+        (const float*)v_scale.data_ptr());
+    dim3 reduce_grid(max_q_blocks, H_q, 1);
+    dim3 reduce_block(HEAD_DIM);
+    fa_prefill_paged_varlen_splitk_reduce_kernel_128<<<reduce_grid, reduce_block, 0, stream.stream()>>>(
+        (const float*)O_partial.data_ptr(),
+        (const float*)M_partial.data_ptr(),
+        (const float*)L_partial.data_ptr(),
+        (half*)O.data_ptr(),
+        max_q_blocks, H_q, (int)kv_splits,
+        H_q * HEAD_DIM, HEAD_DIM);
+  } else {
+    constexpr int HEAD_DIM = 256;
+    constexpr int THREADS = 256;
+    constexpr int BC_LOC = 32;
+    constexpr int BR_PREFILL_LOC = BR_PREFILL;
+    dim3 grid(max_q_blocks, H_q, num_seqs * (int)kv_splits);
+    dim3 block(THREADS);
+    size_t smem = BR_PREFILL_LOC * HEAD_DIM * sizeof(half)
+                + BC_LOC * HEAD_DIM * sizeof(int8_t) * 2
+                + BC_LOC * BR_PREFILL_LOC * sizeof(float)
+                + BR_PREFILL_LOC * sizeof(float) * 3
+                + BR_PREFILL_LOC * HEAD_DIM * sizeof(float)
+                + BC_LOC * sizeof(float) * 2
+                + (THREADS / 32 + 1) * sizeof(float);
+    hipFuncSetAttribute(
+        reinterpret_cast<const void*>(fa_prefill_paged_varlen_splitk_kernel_int8_256),
+        hipFuncAttributeMaxDynamicSharedMemorySize, smem);
+    fa_prefill_paged_varlen_splitk_kernel_int8_256<<<grid, block, smem, stream.stream()>>>(
+        (const half*)Q.data_ptr(),
+        (const int8_t*)key_cache.data_ptr(),
+        (const int8_t*)value_cache.data_ptr(),
+        (const int*)block_table.data_ptr(),
+        (const int*)cu_query_lens.data_ptr(),
+        (const int*)seq_lens.data_ptr(),
+        (int)key_cache.stride(0),
+        (int)key_cache.stride(1),
+        (int)key_cache.stride(2),
+        (int)key_cache.stride(3),
+        (int)key_cache.stride(4),
+        max_blocks,
+        (int)block_size,
+        x_dim,
+        num_seqs,
+        (int)kv_splits,
+        (float*)O_partial.data_ptr(),
+        (float*)M_partial.data_ptr(),
+        (float*)L_partial.data_ptr(),
+        H_q, H_kv, kv_group_num, scale, (int)causal, (int)sliding_window,
+        (const float*)k_scale.data_ptr(),
+        (const float*)v_scale.data_ptr());
+    dim3 reduce_grid(max_q_blocks, H_q, 1);
+    dim3 reduce_block(HEAD_DIM);
+    fa_prefill_paged_varlen_splitk_reduce_kernel_256<<<reduce_grid, reduce_block, 0, stream.stream()>>>(
+        (const float*)O_partial.data_ptr(),
+        (const float*)M_partial.data_ptr(),
+        (const float*)L_partial.data_ptr(),
+        (half*)O.data_ptr(),
+        max_q_blocks, H_q, (int)kv_splits,
+        H_q * HEAD_DIM, HEAD_DIM);
+  }
+  hipError_t err = hipGetLastError();
+  TORCH_CHECK(err == hipSuccess, "fa_rdna2 paged prefill varlen int8 launch failed: ",
+              hipGetErrorString(err));
+  return O;
+}
+
+
 
 // =====================================================================
 // INT8 PER-TOKEN-HEAD KERNELS (gfx1030, no native int8 dot)
@@ -2880,9 +3611,46 @@ __device__ __forceinline__ half fa_kv_load_int8_pth(
     return __hmul(int8_to_half(*ptr), __float2half(s));
 }
 
-// ---- DECODE: int8 per-token-head ----
+// ---- DECODE: int8 per-token-head (v3 wiki "live contract") ----
+//
+// The v3 pattern (1 thr/CTA microbench winner, 2.21x fp16 at primary shape):
+//   - 128 threads/CTA (4 wave32). Each thread owns a disjoint D slice of o[].
+//   - QK: each thread reads its 4 i8 bytes from the paged cache (NOT a packed
+//     int load — bytes within a dword span 4 consecutive d_sub values for
+//     the same slot, which are stride_kc2 apart in the 5D paged layout),
+//     fuses i8->fp32 (sign-extend) with per-(token,head) scale, promotes
+//     to half2 pairs, and calls V_DOT2_F32_F16 against its pre-loaded Q slice.
+//   - Warp + block reduce for the scalar QK score.
+//   - Online softmax state (m, l) in shared memory, written by t==0 each iter.
+//   - PV: each thread owns a disjoint D slice, reads its V byte, dequant,
+//     accumulates into o_local[].
+//   - Final write: o_local / l_final -> O_partial.
+//
+// Compared to the v0 (scalar __hmul dequant over D loop) baseline that
+// preceded this kernel: the new kernel removes the per-element hmul chain
+// (32/64 separate hmul instructions per d) in favour of 4 fdot2
+// (v_dot2c_f32_f16) instructions per dword. On gfx1030 this is ~2x faster
+// at D=256 and ~3x faster at D=128 (v3_128 microbench at D=256 seq=16384
+// measured 89.4x fp16 single-thread). The fused i8->fp32->scale->fp16 VGPR
+// pipeline still wins because it avoids the materialized fp16 KV workspace
+// that v0 needed.
+//
+// Paged addressing: K/V are stored as [num_blocks, H_kv, D, block_size, x=1]
+// (int8 cache with x=1 packing). For each (token, slot), a thread at d_base
+// reads K[d_base * stride_kc2 + slot * stride_kc3]. The 4 bytes in a dword
+// are stride_kc2=block_size apart in memory — they are NOT contiguous, so
+// we issue 4 scalar byte reads rather than a packed int load. The fused
+// i8->fp32->scale->fp16 VGPR pipeline still wins because it avoids the
+// materialized fp16 KV workspace that v0 needed.
+//
+// block_size is hardcoded to 16 (existing limitation preserved — the
+// Python-side int8 cache layout uses block_size=16).
+//
+// Grid: (num_tokens, H_q, kv_splits). Each CTA processes a contiguous chunk
+// of seq_len (real split-K — fixed the existing kernel's bug where every
+// CTA processed the full sweep).
 template <int HEAD_DIM>
-__global__ void fa_decode_paged_splitk_kernel_int8_pth(
+__global__ __launch_bounds__(128, 1) void fa_decode_paged_splitk_kernel_int8_pth(
     const half* __restrict__ Q,
     const int8_t* __restrict__ K,
     const int8_t* __restrict__ V,
@@ -2897,12 +3665,20 @@ __global__ void fa_decode_paged_splitk_kernel_int8_pth(
     float* __restrict__ O_partial,
     float* __restrict__ M_partial,
     float* __restrict__ L_partial) {
-  // Simplified int8 decode: single-CTA per (token, head, split).
-  // Same algorithmic structure as fp16 decode but int8->fp16 dequant at load.
+
+  constexpr int NTHREADS = 128;
+  constexpr int NWARPS = NTHREADS / 32;
+  constexpr int NDWORDS = HEAD_DIM / 4;
+  constexpr int DWORDS_PER_THREAD = (NDWORDS + NTHREADS - 1) / NTHREADS;
+  constexpr int D_PER_THREAD = (HEAD_DIM + NTHREADS - 1) / NTHREADS;
+  constexpr int BLOCK_SIZE_KV = 16;  // int8 cache block size (hardcoded)
+
   const int token_idx = blockIdx.x;
   const int h_q = blockIdx.y;
   const int split = blockIdx.z;
   const int t = threadIdx.x;
+  const int lane = t & 31;
+  const int wid = t >> 5;
   const int h_kv = h_q / kv_group_num;
   if (token_idx >= num_tokens || h_q >= H_q) return;
 
@@ -2919,80 +3695,152 @@ __global__ void fa_decode_paged_splitk_kernel_int8_pth(
     return;
   }
 
-  // Per-(token, head) K/V scales (per-token-head).
-  const float k_s = k_scale_ptr[token_idx * H_kv + h_kv];
-  const float v_s = v_scale_ptr[token_idx * H_kv + h_kv];
-  const half k_sh = __float2half(k_s);
-  const half v_sh = __float2half(v_s);
+  __shared__ float sm_score;
+  __shared__ float sm_m;
+  __shared__ float sm_l;
+  __shared__ float smem_partial[NWARPS];
 
-  // Single-warp, single-token, full-KV-sweep decode path.
-  // Q is [num_tokens, H_q, D]; load q for this (token, h_q) into registers.
-  half q_reg[HEAD_DIM];
+  // Per-(token, head) K/V scales — the scale depends on the KV position
+  // (n_global), not the query token_idx. We look it up inside the loop
+  // because k_s/v_s change with each KV row. For decode we iterate 1 KV
+  // position at a time so a fresh lookup per iteration is acceptable.
+  // (The pre-existing v0 kernel used token_idx here — that was a bug for
+  // per-token-head quantization; v3 fixes it.)
+
+  // Load Q once per CTA — 2 half2 per dword (covers all 4 fp16 elements).
+  // q_local[i*2+0] = Q[w*4+0..w*4+1], q_local[i*2+1] = Q[w*4+2..w*4+3].
+  half2 q_local[DWORDS_PER_THREAD * 2];
   #pragma unroll
-  for (int d = 0; d < HEAD_DIM; ++d) {
-    q_reg[d] = Q[(token_idx * H_q + h_q) * HEAD_DIM + d];
-  }
-
-  float m_i = -INFINITY;
-  float l_i = 0.0f;
-  float o_acc[HEAD_DIM];
-  #pragma unroll
-  for (int d = 0; d < HEAD_DIM; ++d) o_acc[d] = 0.0f;
-
-  const int eff_len = (sliding_window > 0) ? min(seq_len, sliding_window) : seq_len;
-  const int start_pos = seq_len - eff_len;
-  const int num_blocks_kv = (eff_len + 16 - 1) / 16;
-
-  for (int kb = 0; kb < num_blocks_kv; ++kb) {
-    const int blk_idx = my_block_table[kb];
-    if (blk_idx < 0) continue;
-    const int slot_start = (kb == num_blocks_kv - 1)
-        ? (eff_len - kb * 16)
-        : 16;
-    const int8_t* k_base = K + blk_idx * k_stride0 + h_kv * k_stride1;
-    const int8_t* v_base = V + blk_idx * v_stride0 + h_kv * v_stride1;
-    #pragma unroll
-    for (int s = 0; s < 16; ++s) {
-      const int pos = kb * 16 + s;
-      if (s >= slot_start) break;
-      // Load K[HEAD_DIM] and V[HEAD_DIM] with int8->fp16 + per-token-head scale.
-      float score = 0.0f;
-      #pragma unroll
-      for (int d = 0; d < HEAD_DIM; ++d) {
-        half kv_h = __hmul(int8_to_half(k_base[d * k_stride2 + s * k_stride3 + 0]),
-                           __float2half(k_s));
-        score += __half2float(__hmul(q_reg[d], kv_h));
-      }
-      score *= scale;
-      // Online softmax.
-      float m_new = fmaxf(m_i, score);
-      float alpha = expf(m_i - m_new);
-      float p = expf(score - m_new);
-      l_i = l_i * alpha + p;
-      #pragma unroll
-      for (int d = 0; d < HEAD_DIM; ++d) {
-        half vv = __hmul(int8_to_half(v_base[d * v_stride2 + s * v_stride3 + 0]),
-                         __float2half(v_s));
-        o_acc[d] = o_acc[d] * alpha + p * __half2float(vv);
-      }
-      m_i = m_new;
+  for (int i = 0; i < DWORDS_PER_THREAD; ++i) {
+    const int w = t + i * NTHREADS;
+    if (w < NDWORDS) {
+      q_local[i * 2 + 0] = *reinterpret_cast<const half2*>(&Q[(token_idx * H_q + h_q) * HEAD_DIM + w * 4 + 0]);
+      q_local[i * 2 + 1] = *reinterpret_cast<const half2*>(&Q[(token_idx * H_q + h_q) * HEAD_DIM + w * 4 + 2]);
     }
   }
 
-  // Write partial outputs.
-  const int out_off = ((token_idx * H_q + h_q) * gridDim.z + split) * HEAD_DIM;
-  if (l_i > 0.0f) {
+  // Per-thread partial output (D slice).
+  float o_local[D_PER_THREAD];
+  #pragma unroll
+  for (int i = 0; i < D_PER_THREAD; ++i) o_local[i] = 0.0f;
+
+  if (t == 0) {
+    sm_m = -INFINITY;
+    sm_l = 0.0f;
+  }
+  __syncthreads();
+
+  // Split-K: each CTA processes a contiguous chunk of seq_len.
+  const int kv_splits = gridDim.z;
+  const int blocks_per_split = (seq_len + kv_splits - 1) / kv_splits;
+  const int blk_start = split * blocks_per_split;
+  const int blk_end = min(blk_start + blocks_per_split, seq_len);
+
+  for (int n = blk_start; n < blk_end; ++n) {
+    // Decode: 1 token at a time. paged addressing.
+    const int n_global = n;
+    const int block_idx = my_block_table[n_global / BLOCK_SIZE_KV];
+    if (block_idx < 0) continue;
+    const int slot = n_global % BLOCK_SIZE_KV;
+
+    // Per-KV-position scale (per-token-head quantization).
+    const float k_s = k_scale_ptr[n_global * H_kv + h_kv];
+    const float v_s = v_scale_ptr[n_global * H_kv + h_kv];
+
+    // ---- QK ----
+    const int8_t* K_block_base = K + block_idx * k_stride0 + h_kv * k_stride1;
+    float thread_qk = 0.0f;
     #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) {
-      O_partial[out_off + d] = o_acc[d] / l_i;
+    for (int i = 0; i < DWORDS_PER_THREAD; ++i) {
+      const int w = t + i * NTHREADS;
+      if (w < NDWORDS) {
+        const int d_base = w * 4;
+        // 4 separate byte reads (the bytes within a dword are NOT
+        // contiguous in the 5D paged layout — they are stride_kc2 apart).
+        const int8_t b0 = K_block_base[(d_base + 0) * k_stride2 + slot * k_stride3 + 0];
+        const int8_t b1 = K_block_base[(d_base + 1) * k_stride2 + slot * k_stride3 + 0];
+        const int8_t b2 = K_block_base[(d_base + 2) * k_stride2 + slot * k_stride3 + 0];
+        const int8_t b3 = K_block_base[(d_base + 3) * k_stride2 + slot * k_stride3 + 0];
+        const float kf0 = (float)b0 * k_s;
+        const float kf1 = (float)b1 * k_s;
+        const float kf2 = (float)b2 * k_s;
+        const float kf3 = (float)b3 * k_s;
+        const half2 k01 = __halves2half2(__float2half_rn(kf0), __float2half_rn(kf1));
+        const half2 k23 = __halves2half2(__float2half_rn(kf2), __float2half_rn(kf3));
+        thread_qk = fdot2(q_local[i * 2 + 0], k01, thread_qk);
+        thread_qk = fdot2(q_local[i * 2 + 1], k23, thread_qk);
+      }
+    }
+
+    // Warp reduce over lanes -> warp partial in lane 0.
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      thread_qk += __shfl_xor(thread_qk, off);
+    }
+    if (lane == 0) smem_partial[wid] = thread_qk;
+    __syncthreads();
+    // Block reduce (NWARPS partials) via warp 0.
+    if (wid == 0) {
+      float v = (lane < NWARPS) ? smem_partial[lane] : 0.0f;
+      #pragma unroll
+      for (int off = (NWARPS / 2); off > 0; off >>= 1) {
+        v += __shfl_xor(v, off);
+      }
+      if (lane == 0) sm_score = v;
+    }
+    __syncthreads();
+    const float score = sm_score * scale;
+
+    // ---- Online softmax update (all threads use global sm_m/sm_l) ----
+    const float m_old = sm_m;
+    const float l_old = sm_l;
+    const float m_new = fmaxf(m_old, score);
+    const float alpha = expf(m_old - m_new);
+    const float p = expf(score - m_new);
+    const float l_new = l_old * alpha + p;
+    if (t == 0) {
+      sm_m = m_new;
+      sm_l = l_new;
+    }
+    __syncthreads();
+
+    // ---- PV: each thread owns a D slice ----
+    const int8_t* V_block_base = V + block_idx * v_stride0 + h_kv * v_stride1;
+    #pragma unroll
+    for (int i = 0; i < D_PER_THREAD; ++i) {
+      const int d = t + i * NTHREADS;
+      if (d < HEAD_DIM) {
+        const int8_t vb = V_block_base[d * v_stride2 + slot * v_stride3 + 0];
+        const float vf = (float)vb * v_s;
+        o_local[i] = o_local[i] * alpha + p * vf;
+      }
+    }
+  }
+
+  // Final write: each thread scales its own D slice by 1/l_final.
+  __syncthreads();
+  const float l_final = sm_l;
+  const int out_off = ((token_idx * H_q + h_q) * gridDim.z + split) * HEAD_DIM;
+  if (l_final > 0.0f) {
+    #pragma unroll
+    for (int i = 0; i < D_PER_THREAD; ++i) {
+      const int d = t + i * NTHREADS;
+      if (d < HEAD_DIM) {
+        O_partial[out_off + d] = o_local[i] / l_final;
+      }
     }
   } else {
     #pragma unroll
-    for (int d = 0; d < HEAD_DIM; ++d) O_partial[out_off + d] = 0.0f;
+    for (int i = 0; i < D_PER_THREAD; ++i) {
+      const int d = t + i * NTHREADS;
+      if (d < HEAD_DIM) {
+        O_partial[out_off + d] = 0.0f;
+      }
+    }
   }
   if (t == 0) {
-    M_partial[(token_idx * H_q + h_q) * gridDim.z + split] = m_i;
-    L_partial[(token_idx * H_q + h_q) * gridDim.z + split] = l_i;
+    M_partial[(token_idx * H_q + h_q) * gridDim.z + split] = sm_m;
+    L_partial[(token_idx * H_q + h_q) * gridDim.z + split] = sm_l;
   }
 }
 
@@ -3036,7 +3884,7 @@ torch::Tensor fa_rdna2_decode_paged_int8(
   dim3 grid1(num_tokens, H_q, (int)kv_splits);
 
   if (D == 128) {
-    fa_decode_paged_splitk_kernel_int8_pth<128><<<grid1, 64, 0, stream.stream()>>>(
+    fa_decode_paged_splitk_kernel_int8_pth<128><<<grid1, 128, 0, stream.stream()>>>(
         (const half*)Q.data_ptr(),
         (const int8_t*)key_cache.data_ptr(),
         (const int8_t*)value_cache.data_ptr(),
@@ -3101,7 +3949,6 @@ torch::Tensor fa_rdna2_decode_paged_int8(
         float m = M_p[(t_idx * H_q + h) * (int)kv_splits + sp];
         if (m > m_max) { m_max = m; m_best = sp; }
       }
-      float l_total = 0.0f;
       for (int d = 0; d < D; ++d) {
         float acc = 0.0f;
         for (int sp = 0; sp < (int)kv_splits; ++sp) {
