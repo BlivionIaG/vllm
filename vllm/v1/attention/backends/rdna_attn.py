@@ -442,7 +442,7 @@ class RdnaAttentionImpl(AttentionImpl):
                     block_table,
                     seqused_k,
                     paged_block_size,
-                    kv_splits=8,
+                    kv_splits=1,
                     sliding_window=sliding_window,
                     k_scale=getattr(self, "_k_scale_tensor", None),
                     v_scale=getattr(self, "_v_scale_tensor", None),
