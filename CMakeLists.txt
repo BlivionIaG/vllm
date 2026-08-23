@@ -1469,7 +1469,8 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/rocm/mxfp4_dot2_moe.cu"
       "csrc/rocm/mxfp4_dot2_dense.cu"
       "csrc/rocm/indexer_paged_mqa_rdna2.cu"
-      "csrc/rocm/sparse_mla_rdna2.cu")
+      "csrc/rocm/sparse_mla_rdna2.cu"
+      "csrc/rocm/gdn_decode_rdna2.cu")
   endif()
 
   set(VLLM_ROCM_HAS_GFX1100 OFF)

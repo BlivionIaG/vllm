@@ -232,3 +232,21 @@ void reshape_and_cache_int8_rdna2(
     torch::Tensor kv_cache,    // [2, num_blocks, H_kv, D + 4, block_size] int8
     torch::Tensor slot_mapping // [num_tokens] int32 (-1 = skip)
 );
+
+// GatedDeltaNet (GDN) packed single-token decode for AMD RDNA2 (gfx1030).
+// Hand port of fused_recurrent_gated_delta_rule_packed_decode_kernel
+// (is_kda=False, scalar per-head sigmoid gating, qk-l2norm in kernel).
+// Workgroup = one (token, value-head, V-tile); 256 threads hold the
+// [32, 128] fp32 state tile in registers; K-reductions are warp-local
+// __shfl_xor. head_k_dim must be 128; fp16 in/out, fp32 in-place state.
+void gdn_decode_rdna2(
+    torch::Tensor mixed_qkv,          // [B, 2*H*K + HV*V] fp16
+    torch::Tensor a,                  // [B, HV] fp16
+    torch::Tensor b,                  // [B, HV] fp16
+    torch::Tensor A_log,              // [HV] fp32
+    torch::Tensor dt_bias,            // [HV] fp32
+    torch::Tensor out,                // [B, 1, HV, V] fp16
+    torch::Tensor initial_state,      // [blocks, HV, V, K] fp32, in-place
+    torch::Tensor ssm_state_indices,  // [B] int32
+    double scale,
+    bool use_qk_l2norm);
