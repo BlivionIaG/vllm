@@ -140,15 +140,17 @@ def test_gdn_prefill_o_rdna2_parity_uniform(Hg, H, B, T):
         [65, 100, 99],     # mixed-length with non-aligned tails
         [1],               # single-token sequence
         [1, 63, 1],        # odd-tail sequences
-        [0, 65, 0, 130],   # zero-length seqs to verify empty-seq handling
         [130, 200, 264, 7],  # mixed batch
     ],
 )
 def test_gdn_prefill_o_rdna2_parity_varlen(Hg, H, lens):
     """Varlen (cu_seqlens-flattened, B==1) parity with mixed chunk-
-    boundary tails and odd-length sequences. Includes a zero-length
-    sequence to verify empty-seq handling and a single-token sequence
-    to probe the tail-oddity fdot2 path."""
+    boundary tails and odd-length sequences. A single-token sequence
+    probes the tail-oddity fdot2 path. Zero-length sequences are
+    excluded: the FLA reference's prepare_chunk_indices numbers
+    sequences by counting chunk-starts, so it mis-assigns chunks when
+    an empty sequence is present, and empty sequences cannot occur in
+    production (every request has >= 1 token)."""
     if H % Hg != 0:
         pytest.skip(f"skipping invalid GQA ratio H={H} Hg={Hg}")
     cu_list = [0]
@@ -156,7 +158,9 @@ def test_gdn_prefill_o_rdna2_parity_varlen(Hg, H, lens):
         cu_list.append(cu_list[-1] + L)
     cu = torch.tensor(cu_list, dtype=torch.int32, device=device)
     chunk_indices = prepare_chunk_indices(cu, BT)
-    chunk_offsets = prepare_chunk_offsets(cu, BT)
+    # prepare_chunk_offsets returns int64; the kernel (like the production
+    # dispatch, which coerces index tensors to int32) requires int32.
+    chunk_offsets = prepare_chunk_offsets(cu, BT).to(torch.int32)
     T = cu_list[-1]
     gen = torch.Generator(device=device).manual_seed(
         _seed_for("v", Hg, H, T, tuple(lens)))

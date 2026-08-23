@@ -104,19 +104,23 @@ __device__ __forceinline__ void gdn_lds_load(__half* dst,
                 "TOTAL/2 must be divisible by GDN_THREADS");
   static_assert(HALF2_TOTAL * 2 == TOTAL,
                 "TOTAL must be even for half2 vectorized loads");
-  // Zero-fill so OOB rows are already 0 even if we skip the store.
-  // For __half (vectorized) we init all lanes then overwrite valid rows;
-  // for float we only write the valid rows in the loop below.
-  if (std::is_same<HT, __half>::value) {
+  // Zero-fill every row up front so OOB rows stay 0 when the valid-row
+  // loop below skips them. Done for BOTH dtypes: the float path used to
+  // skip this, leaving OOB rows as stale LDS (latent bug; the only current
+  // float caller passes valid_rows == ROWS, so this is defensive).
 #pragma unroll
-    for (int s = 0; s < HALF2_PER_THREAD; ++s) {
-      const int idx = s * GDN_THREADS + threadIdx.x;
-      const int row = idx / (COLS / 2);
-      const long loff = (long)row * COLS;
-      dst[loff] = __float2half(0.0f);
-      dst[loff + 1] = __float2half(0.0f);
-    }
+  for (int s = 0; s < HALF2_PER_THREAD; ++s) {
+    const int idx = s * GDN_THREADS + threadIdx.x;
+    const int row = idx / (COLS / 2);
+    const int col_v = (idx % (COLS / 2)) * 2;
+    const long loff = (long)row * COLS + col_v;
+    dst[loff] = __float2half(0.0f);
+    dst[loff + 1] = __float2half(0.0f);
   }
+  // Zero-fills must be visible before any thread's copy overwrites a valid
+  // row: without this barrier a zero-store from one thread can land after
+  // another thread's real-data store to the same element (sparse clobber).
+  __syncthreads();
 #pragma unroll
   for (int s = 0; s < HALF2_PER_THREAD; ++s) {
     const int idx = s * GDN_THREADS + threadIdx.x;
@@ -228,7 +232,7 @@ __global__ void __launch_bounds__(GDN_THREADS)
   // belongs to, found by walking chunk_offsets.
   // In varlen mode i_t is already the global flat chunk index, so
   // i_tg == i_t. The walk below only determines i_n to read bos / T_local.
-  int bos, T_local, i_tg;
+  int bos, T_local, i_tg, i_t_local;
   if (is_varlen) {
     int i_n = 0;
     while (i_n < N_seqs && chunk_offsets[i_n + 1] <= i_t) {
@@ -238,10 +242,12 @@ __global__ void __launch_bounds__(GDN_THREADS)
     const int eos = cu_seqlens[i_n + 1];
     T_local = eos - bos;
     i_tg = i_t;
+    i_t_local = i_t - chunk_offsets[i_n];
   } else {
     bos = i_b * T;
     T_local = T;
     i_tg = i_b * NT + i_t;
+    i_t_local = i_t;
   }
 
   // Per-head pointers. All point to sequence start (bos); the chunk offset
@@ -283,7 +289,7 @@ __global__ void __launch_bounds__(GDN_THREADS)
   // thread b_A gating step uses s_bg to broadcast across the workgroup).
   float bg[GDN_AROW];
 
-  const bool chunk_fully_oob = (i_t * GDN_BT) >= T_local;
+  const bool chunk_fully_oob = (i_t_local * GDN_BT) >= T_local;
 
   if (!chunk_fully_oob) {
     // Reset bo (b_o) at the START of each chunk — matching reference
@@ -302,9 +308,9 @@ __global__ void __launch_bounds__(GDN_THREADS)
     // ---- Stage 1: load q[BT, K] and k[BT, K] into LDS ----------------
     // Offset pointers by chunk start (i_t*BT) to match reference.
     // q/k/v are [B*T, Hg/H, K/V]; the T-dimension offset is i_t*BT.
-    const long chunk_off_qk = (long)i_t * GDN_BT * stride_q_tok;
-    const long chunk_off_v  = (long)i_t * GDN_BT * stride_v_tok;
-    const int valid_rows = T_local - i_t * GDN_BT;
+    const long chunk_off_qk = (long)i_t_local * GDN_BT * stride_q_tok;
+    const long chunk_off_v  = (long)i_t_local * GDN_BT * stride_v_tok;
+    const int valid_rows = T_local - i_t_local * GDN_BT;
     gdn_lds_load<__half, GDN_BT, GDN_K>(s_q, p_q + chunk_off_qk, stride_q_tok, valid_rows);
     gdn_lds_load<__half, GDN_BT, GDN_K>(s_k, p_k + chunk_off_qk, stride_k_tok, valid_rows);
     __syncthreads();
@@ -371,7 +377,7 @@ __global__ void __launch_bounds__(GDN_THREADS)
     // ---- Stage 3: load g_cumsum[BT] per row to s_bg ------------------
 #pragma unroll
     for (int dr = 0; dr < GDN_AROW; ++dr) {
-      const int row_local = i_t * GDN_BT + rb * GDN_AROW + dr;
+      const int row_local = i_t_local * GDN_BT + rb * GDN_AROW + dr;
       bg[dr] = (row_local < T_local)
                    ? p_g[(long)row_local * stride_g_tok]
                    : 0.0f;
@@ -379,20 +385,17 @@ __global__ void __launch_bounds__(GDN_THREADS)
     }
     __syncthreads();
 
-    // ---- Scale b_o (chunk_o.py:137) and apply exp(g) to b_o ---------
-    // Mathematically (b_o*scale)*exp(g) == (b_o*exp(g))*scale (fp32 mul
-    // is commutative), but the order here mirrors Triton's: scale
-    // first, then exp, so the per-element intermediate magnitudes match.
+    // ---- Apply exp(g) to b_o (chunk_o.py:117), then scale (:137) -----
+    // Reference order is (b_o * exp(g)) * scale. fp32 mul is commutative
+    // but matching the reference's rounding order minimises last-bit drift.
+#pragma unroll
+    for (int dr = 0; dr < GDN_AROW; ++dr)
+#pragma unroll
+      for (int do_ = 0; do_ < GDN_OCOL; ++do_) bo[dr][do_] *= expf(bg[dr]);
 #pragma unroll
     for (int dr = 0; dr < GDN_AROW; ++dr)
 #pragma unroll
       for (int do_ = 0; do_ < GDN_OCOL; ++do_) bo[dr][do_] *= scale;
-#pragma unroll
-    for (int dr = 0; dr < GDN_AROW; ++dr)
-#pragma unroll
-      for (int do_ = 0; do_ < GDN_OCOL; ++do_) {
-        bo[dr][do_] *= expf(bg[dr]);
-      }
 
     // ---- Gating + INCLUSIVE >= causal mask on b_A --------------------
     // Mirrors chunk_o.py:120 then :124. Gating is applied BEFORE the
@@ -403,12 +406,12 @@ __global__ void __launch_bounds__(GDN_THREADS)
       bool m_rt[GDN_AROW], m_ct[GDN_ACOL];
 #pragma unroll
       for (int dr = 0; dr < GDN_AROW; ++dr) {
-        o_rt[dr] = i_t * GDN_BT + rb * GDN_AROW + dr;
+        o_rt[dr] = i_t_local * GDN_BT + rb * GDN_AROW + dr;
         m_rt[dr] = o_rt[dr] < T_local;
       }
 #pragma unroll
       for (int dc = 0; dc < GDN_ACOL; ++dc) {
-        o_ct[dc] = i_t * GDN_BT + cb * GDN_ACOL + dc;
+        o_ct[dc] = i_t_local * GDN_BT + cb * GDN_ACOL + dc;
         m_ct[dc] = o_ct[dc] < T_local;
       }
       // Apply gating first (fp32 multiply) — exp(bg[dr] - bg[col]).
@@ -437,7 +440,7 @@ __global__ void __launch_bounds__(GDN_THREADS)
     // chunk; OOB rows are zero-filled so the dot's contributions vanish.
     // p_v must include the chunk offset (i_t*BT*H*V) so v[c,oc] maps
     // to v[bos+i_t*BT+c, i_h, i_v*BV+oc].
-    int valid_rows_v = T_local - i_t * GDN_BT;
+    int valid_rows_v = T_local - i_t_local * GDN_BT;
     if (valid_rows_v > GDN_BT) valid_rows_v = GDN_BT;
     if (valid_rows_v < 0) valid_rows_v = 0;
     gdn_lds_load_v_transposed<GDN_BT, GDN_BV>(
@@ -446,12 +449,18 @@ __global__ void __launch_bounds__(GDN_THREADS)
     __syncthreads();
 
     // ---- Dot 3: bo += (b_A.to(fp16) @ v) * scale (V_DOT2_F32_F16) ---
-    // For each (r, oc) owned by this thread:
-    //   bo[r, oc] += sum_{c=0..BT-1} b_A[r, c] * v[c, oc] * scale
-    // Because s_v_T[oc, c] is a half2 of (v[c, oc], v[c+1, oc]) along
-    // the c-axis, we can do V_DOT2 over c pairs (cp = 0..31).
+    // Reference (chunk_o.py:137): b_o = b_o*scale + tl.dot(b_A,b_v)*scale.
+    // Chain one fp32 accumulator per output element across all BT/2 pairs
+    // (matching tl.dot's single accumulation), then scale once and add.
+    // s_v_T[oc, c] is a half2 of (v[c, oc], v[c+1, oc]) along the c-axis,
+    // so V_DOT2 runs over c pairs (cp = 0..31).
     {
       constexpr int C_PAIRS = GDN_BT / 2;
+      float dot3[GDN_AROW][GDN_OCOL];
+#pragma unroll
+      for (int dr = 0; dr < GDN_AROW; ++dr)
+#pragma unroll
+        for (int do_ = 0; do_ < GDN_OCOL; ++do_) dot3[dr][do_] = 0.0f;
 #pragma unroll
       for (int cp = 0; cp < C_PAIRS; ++cp) {
         // 4 half2's: bA[r, cp*2..cp*2+1] for each row r in the sub-block.
@@ -471,12 +480,15 @@ __global__ void __launch_bounds__(GDN_THREADS)
             const long v_off = (long)oc * GDN_BT + cp * 2;
             // s_v_T[oc, cp*2..cp*2+1] = (v[cp*2, oc], v[cp*2+1, oc])
             half2 v_pair = *reinterpret_cast<half2*>(&s_v[v_off]);
-            // dot = bA[r, cp*2]*v[cp*2, oc] + bA[r, cp*2+1]*v[cp*2+1, oc]
-            float acc = gdn_fdot2(bA_pair[dr], v_pair, 0.0f);
-            bo[dr][do_] += acc * scale;
+            dot3[dr][do_] = gdn_fdot2(bA_pair[dr], v_pair, dot3[dr][do_]);
           }
         }
       }
+#pragma unroll
+      for (int dr = 0; dr < GDN_AROW; ++dr)
+#pragma unroll
+        for (int do_ = 0; do_ < GDN_OCOL; ++do_)
+          bo[dr][do_] += dot3[dr][do_] * scale;
     }
     __syncthreads();
   }  // !chunk_fully_oob
@@ -485,7 +497,7 @@ __global__ void __launch_bounds__(GDN_THREADS)
 #pragma unroll
   for (int dr = 0; dr < GDN_AROW; ++dr) {
     const int row = rb * GDN_AROW + dr;
-    const int row_local = i_t * GDN_BT + row;
+    const int row_local = i_t_local * GDN_BT + row;
     if (row_local >= T_local) continue;
 #pragma unroll
     for (int do_ = 0; do_ < GDN_OCOL; ++do_) {
