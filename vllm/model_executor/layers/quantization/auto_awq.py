@@ -954,7 +954,7 @@ class AutoAWQLinearMethod(BaseAWQLinearMethod):
         reshaped_x = x.reshape(-1, x.shape[-1])
 
         # num_tokens >= threshold
-        FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= 256
+        FP16_MATMUL_HEURISTIC_CONDITION = x.shape[:-1].numel() >= envs.VLLM_AWQ_FP16_MATMUL_MIN_M
         # Batch invariant mode requires torch.matmul path
         # for Triton override
         if FP16_MATMUL_HEURISTIC_CONDITION or envs.VLLM_BATCH_INVARIANT:

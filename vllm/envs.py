@@ -116,6 +116,12 @@ if TYPE_CHECKING:
     VLLM_FORCE_AOT_LOAD: bool = False
     VLLM_USE_MEGA_AOT_ARTIFACT: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
+    # Minimum M (flattened num_tokens) at which AWQ dense layers use the
+    # dequant + fp16 torch.matmul (rocBLAS) route instead of the fused AWQ
+    # Triton GEMM. Default 256 preserves prior behavior; on gfx1030 (RDNA2)
+    # the measured crossover is 128 on all production shapes (dequant+rocBLAS
+    # is 1.3-2.2x faster there), so gfx1030 deployments should set 128.
+    VLLM_AWQ_FP16_MATMUL_MIN_M: int = 256
     VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
@@ -1139,6 +1145,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will use Triton implementations of AWQ.
     "VLLM_USE_TRITON_AWQ": lambda: bool(int(os.getenv("VLLM_USE_TRITON_AWQ", "0"))),
+    "VLLM_AWQ_FP16_MATMUL_MIN_M": lambda: int(os.getenv("VLLM_AWQ_FP16_MATMUL_MIN_M", "256")),
     # If set, monkey-patch triton.runtime.autotuner.Autotuner.run to skip
     # benchmarking and select the first valid config (walking past invalid
     # ones). Used to eliminate autotuning variability when measuring kernel
