@@ -193,11 +193,11 @@ __global__ void __launch_bounds__(GDN_THREADS)
     // 3. USE_G gating. g_last is the cumulative gate at the last valid
     //    token of this chunk; v_corr is scaled by exp(g_last - g[t])
     //    (zero for tail tokens since v_corr[t] == 0 there), and h is
-    //    scaled by exp(g_last).
-    const int last_idx = chunk_start + t_len - 1;
-    const float g_last = p_g[(long)last_idx * H];
+    //    scaled by exp(g_last). p_g is advanced per chunk (below), so the
+    //    gate is indexed chunk-locally (t), not by the global token.
+    const float g_last = p_g[(long)(t_len - 1) * H];
     for (int t = 0; t < t_len; ++t) {
-      const float g_t = p_g[(long)(chunk_start + t) * H];
+      const float g_t = p_g[(long)t * H];
       v_corr[t] *= expf(g_last - g_t);
     }
     const float decay = expf(g_last);
@@ -248,7 +248,17 @@ __global__ void __launch_bounds__(GDN_THREADS)
       }
     }
 
+    // Advance the per-chunk streaming pointers. p_h walks the 5D h chunk
+    // slots; p_k/p_w/p_u/p_vnew/p_g walk the token axis by BT so the loop
+    // body indexes chunk-locally. (Previously only p_h advanced, so chunks
+    // i_t >= 1 re-read chunk 0's k/w/u and blew up via the (I - k0^T w0)
+    // feedback.)
     p_h += stride_h;
+    p_k += (long)GDN_BT * Hg * GDN_K;
+    p_w += (long)GDN_BT * H * GDN_K;
+    p_u += (long)GDN_BT * H * GDN_V;
+    p_vnew += (long)GDN_BT * H * GDN_V;
+    p_g += (long)GDN_BT * H;
   }
 
   // Epilogue: persist the post-final h register state to the float
