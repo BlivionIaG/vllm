@@ -1456,6 +1456,7 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
   endif()
 
   set(VLLM_ROCM_HAS_GFX1030 OFF)
+  message(STATUS "[DEBUG] VLLM_GPU_ARCHES='${VLLM_GPU_ARCHES}'")
   if(VLLM_GPU_ARCHES MATCHES "gfx1030")
     set(VLLM_ROCM_HAS_GFX1030 ON)
     list(APPEND VLLM_ROCM_EXT_SRC
@@ -1470,7 +1471,12 @@ if(VLLM_GPU_LANG STREQUAL "HIP")
       "csrc/rocm/mxfp4_dot2_dense.cu"
       "csrc/rocm/indexer_paged_mqa_rdna2.cu"
       "csrc/rocm/sparse_mla_rdna2.cu"
-      "csrc/rocm/gdn_decode_rdna2.cu")
+      "csrc/rocm/gdn_decode_rdna2.cu"
+      "csrc/rocm/gdn_prefill_prep_rdna2.cu"
+      "csrc/rocm/gdn_prefill_kkt_rdna2.cu"
+      "csrc/rocm/gdn_prefill_solve_wy_rdna2.cu"
+      "csrc/rocm/gdn_prefill_delta_h_rdna2.cu"
+      "csrc/rocm/gdn_prefill_o_rdna2.cu")
   endif()
 
   set(VLLM_ROCM_HAS_GFX1100 OFF)
