@@ -153,16 +153,28 @@ __global__ void __launch_bounds__(PREP_THREADS)
     const long k_off_row = qkv_row + HK + (long)i_h * 128 + kv_k_start;
 
     // Load this lane's 64 q elements and 64 k elements (masked past t_chunk).
+    // Vectorized as 32 __half2 loads (each element's fp16 pair stays
+    // contiguous and even-aligned: q_off/k_off are multiples of 2).
     float q_local[PREP_ELEMS_PER_LANE];
     float k_local[PREP_ELEMS_PER_LANE];
+    const __half2* q_src =
+        reinterpret_cast<const __half2*>(mixed_qkv + q_off_row);
+    const __half2* k_src =
+        reinterpret_cast<const __half2*>(mixed_qkv + k_off_row);
 #pragma unroll
-    for (int j = 0; j < PREP_ELEMS_PER_LANE; ++j) {
-      q_local[j] = 0.0f;
-      k_local[j] = 0.0f;
+    for (int j = 0; j < PREP_ELEMS_PER_LANE / 2; ++j) {
+      __half2 qp, kp;
       if (kv_tok_valid) {
-        q_local[j] = __half2float(mixed_qkv[q_off_row + j]);
-        k_local[j] = __half2float(mixed_qkv[k_off_row + j]);
+        qp = q_src[j];
+        kp = k_src[j];
+      } else {
+        qp = __halves2half2(__float2half_rn(0.0f), __float2half_rn(0.0f));
+        kp = __halves2half2(__float2half_rn(0.0f), __float2half_rn(0.0f));
       }
+      q_local[2 * j] = __half2float(__low2half(qp));
+      q_local[2 * j + 1] = __half2float(__high2half(qp));
+      k_local[2 * j] = __half2float(__low2half(kp));
+      k_local[2 * j + 1] = __half2float(__high2half(kp));
     }
 
     // L2 norm reduction over K=128: each token is owned by a pair of lanes.
@@ -185,16 +197,20 @@ __global__ void __launch_bounds__(PREP_THREADS)
       k_local[j] *= k_inv;
     }
 
-    // Store q and k.
+    // Store q and k (vectorized __half2, even-aligned rows).
     if (kv_tok_valid) {
       const long q_out_row =
           kv_t_abs * stride_q_tok + (long)i_h * 128 + kv_k_start;
       const long k_out_row =
           kv_t_abs * stride_k_tok + (long)i_h * 128 + kv_k_start;
+      __half2* q_dst = reinterpret_cast<__half2*>(q + q_out_row);
+      __half2* k_dst = reinterpret_cast<__half2*>(k_out + k_out_row);
 #pragma unroll
-      for (int j = 0; j < PREP_ELEMS_PER_LANE; ++j) {
-        q[q_out_row + j] = __float2half(q_local[j]);
-        k_out[k_out_row + j] = __float2half(k_local[j]);
+      for (int j = 0; j < PREP_ELEMS_PER_LANE / 2; ++j) {
+        q_dst[j] = __halves2half2(__float2half(q_local[2 * j]),
+                                __float2half(q_local[2 * j + 1]));
+        k_dst[j] = __halves2half2(__float2half(k_local[2 * j]),
+                                __float2half(k_local[2 * j + 1]));
       }
     }
   } else {
@@ -204,14 +220,18 @@ __global__ void __launch_bounds__(PREP_THREADS)
     const long V_OFFSET = 2 * HK;
 
     // ---- v passthrough (all 128 threads; token-pair decomposition) ----
+    // Vectorized __half2 copy: v_in/v_out rows are even-aligned.
     const long v_in_row =
         kv_t_abs * stride_x_tok + V_OFFSET + (long)i_hv * 128 + kv_k_start;
     const long v_out_row =
         kv_t_abs * stride_v_tok + (long)i_hv * 128 + kv_k_start;
     if (kv_tok_valid) {
+      const __half2* v_src =
+          reinterpret_cast<const __half2*>(mixed_qkv + v_in_row);
+      __half2* v_dst = reinterpret_cast<__half2*>(v + v_out_row);
 #pragma unroll
-      for (int j = 0; j < PREP_ELEMS_PER_LANE; ++j) {
-        v[v_out_row + j] = mixed_qkv[v_in_row + j];
+      for (int j = 0; j < PREP_ELEMS_PER_LANE / 2; ++j) {
+        v_dst[j] = v_src[j];
       }
     }
 
