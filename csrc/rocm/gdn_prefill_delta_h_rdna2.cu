@@ -174,7 +174,12 @@ __global__ void __launch_bounds__(GDN_THREADS)
     //    -> gate -> h-update. v_corr is 2 scalars (v_corr0, v_corr1),
     //    not a 64-element array. expf and fdot2 ordering match the
     //    original t-by-t sequence -> bit-identical fp32 results.
-#pragma unroll
+    //    NB: partial #pragma unroll 8 on the 32-iteration loop - the full
+    //    unroll hoists all iterations' w/k loads into registers and
+    //    caused the 256-VGPR saturation / 94 spills (rocprof). Sweep:
+    //    rolled 18.64ms/59VGPR, u2 18.18ms, u4 18.08ms/114VGPR,
+    //    u8 17.69ms/182VGPR (best, 0 spills), u16 20.59ms (spills return).
+#pragma unroll 8
     for (int tp = 0; tp < GDN_BT / 2; ++tp) {
       const int t0 = 2 * tp;
       const int t1 = t0 + 1;
