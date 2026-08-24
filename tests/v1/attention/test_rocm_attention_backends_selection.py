@@ -345,3 +345,33 @@ def test_sparse_not_supported(mock_vllm_config):
         RocmPlatform.get_attn_backend_cls(
             selected_backend=None, attn_selector_config=attn_selector_config
         )
+
+
+@pytest.mark.parametrize(
+    "on_cdna_val, on_gfx1x_val, on_gfx10x_val, expected_backend",
+    [
+        # RDNA2: Triton attention avoids quadratic SDPA math backend.
+        (False, False, True, AttentionBackendEnum.TRITON_ATTN),
+        # Non-RDNA/non-CDNA (unreachable on ROCm): SDPA fallback.
+        (False, False, False, AttentionBackendEnum.TORCH_SDPA),
+    ],
+)
+def test_vit_attention_backend_selection(
+    on_cdna_val,
+    on_gfx1x_val,
+    on_gfx10x_val,
+    expected_backend,
+    monkeypatch,
+):
+    """Test ViT attention backend selection on gfx10x (RDNA2)."""
+    from vllm.platforms import rocm
+
+    monkeypatch.setattr(rocm, "on_cdna", lambda: on_cdna_val)
+    monkeypatch.setattr(rocm, "on_gfx1x", lambda: on_gfx1x_val)
+    monkeypatch.setattr(rocm, "on_gfx10x", lambda: on_gfx10x_val)
+    monkeypatch.setattr(rocm, "flash_attn_triton_available", lambda: False)
+
+    backend = rocm.RocmPlatform.get_vit_attn_backend(
+        head_size=128, dtype=torch.float16
+    )
+    assert backend == expected_backend

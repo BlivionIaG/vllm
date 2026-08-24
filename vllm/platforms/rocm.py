@@ -723,6 +723,16 @@ class RocmPlatform(Platform):
             )
             return AttentionBackendEnum.FLASH_ATTN
 
+        # RDNA2 (gfx10xx): Use the Triton attention backend to avoid the
+        # quadratic SDPA math backend, which materializes [B, H, N, N]
+        # attention scores and OOMs on large ViT feature maps (e.g. Qwen3-VL
+        # encoder profiling with the max-feature-size dummy image).
+        if on_gfx10x():
+            logger.info_once(
+                "Using Triton attention backend for ViT model on RDNA2."
+            )
+            return AttentionBackendEnum.TRITON_ATTN
+
         logger.info_once("Using Torch SDPA backend for ViT model.")
         return AttentionBackendEnum.TORCH_SDPA
 
