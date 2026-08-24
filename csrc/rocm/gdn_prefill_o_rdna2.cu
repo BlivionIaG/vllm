@@ -48,17 +48,17 @@ namespace {
 // Tile dimensions — match vllm/third_party/flash_linear_attention/ops/utils.py
 // FLA_CHUNK_SIZE=64 for the Qwen3.5/3.6 GDN path. K and V default to 128.
 constexpr int GDN_BT = 64;
-constexpr int GDN_BV = 32;
+constexpr int GDN_BV = 64;
 constexpr int GDN_K = 128;
 constexpr int GDN_V = 128;
 constexpr int GDN_THREADS = 256;
 
 // Sub-block owned by one thread inside the [BT, BT] fp32 b_A tile and
-// the [BT, BV] fp32 b_o tile. 4 rows x 4 cols of A = 16 fp32; 4 rows x 2
-// cols of o = 8 fp32 (BV=32 -> col-block size halves vs A's 4).
+// the [BT, BV] fp32 b_o tile. 4 rows x 4 cols of A = 16 fp32; 4 rows x 4
+// cols of o = 16 fp32 (BV=64 -> col-block size matches A's 4).
 constexpr int GDN_AROW = 4;
 constexpr int GDN_ACOL = 4;
-constexpr int GDN_OCOL = 2;
+constexpr int GDN_OCOL = 4;
 static_assert(GDN_BT / GDN_AROW * GDN_BT / GDN_ACOL == GDN_THREADS,
               "thread count must equal (BT/AROW)*(BT/ACOL)");
 static_assert(GDN_BT / GDN_AROW * GDN_BV / GDN_OCOL == GDN_THREADS,
