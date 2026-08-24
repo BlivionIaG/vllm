@@ -3,7 +3,7 @@
 // chunk_gated_delta_rule_fwd_kernel_h_blockdim64
 // (vllm/third_party/flash_linear_attention/ops/chunk_delta_h.py).
 //
-// Workgroup = one (V-tile, sequence x value-head). 256 threads = 32 v-rows
+// Workgroup = one (V-tile, sequence x value-head). 128 threads = 16 v-rows
 // x 8 k-slices, the exact lane layout of gdn_decode_rdna2.cu
 // (v = lane >> 3, ks = lane & 7); each thread owns 16 fp32 state
 // registers h[v, ks*16 : ks*16+16], register-resident across the entire
@@ -43,8 +43,8 @@ namespace {
 constexpr int GDN_K = 128;        // head_k_dim; fixed by the 8x16 slice layout
 constexpr int GDN_V = 128;        // head_v_dim
 constexpr int GDN_BT = 64;        // FLA_CHUNK_SIZE
-constexpr int GDN_BV = 32;        // V rows per workgroup (V/GDN_BV = 4 tiles)
-constexpr int GDN_THREADS = 256;  // 32 v-rows * 8 k-slices
+constexpr int GDN_BV = 16;        // V rows per workgroup (V/GDN_BV = 8 tiles)
+constexpr int GDN_THREADS = 128;  // 16 v-rows * 8 k-slices
 
 // Reduction across the 8 k-slice lanes sharing one v-row. Lane layout is
 // v = lane >> 3, ks = lane & 7, so masks 1/2/4 stay inside the group.
@@ -145,97 +145,96 @@ __global__ void __launch_bounds__(GDN_THREADS)
       h + ((h_base_t * H + i_h) * GDN_V * GDN_K + (long)o_v * GDN_K) + k0;
   const long stride_h = (long)H * GDN_V * GDN_K;
 
-  // ---- Serial recurrence over this sequence's chunks -----------------
+// ---- Serial recurrence over this sequence's chunks -----------------
   for (int i_t = 0; i_t < NT_seq; ++i_t) {
     const int chunk_start = i_t * GDN_BT;
     const int t_len =
         (chunk_start + GDN_BT <= T_seq) ? GDN_BT : (T_seq - chunk_start);
 
-    // 1. Store the pre-update h tile (fp16, rtne) for chunk_fwd_o. The
-    //    register state stays fp32; only the persisted copy is rounded.
+    // 1. Store pre-update h (fp16 rtne) for chunk_fwd_o.
     if (v_ok) {
 #pragma unroll
       for (int j = 0; j < 16; ++j) p_h[j] = __float2half_rn(hreg[j]);
     }
 
-    // 2. v-correction: v_raw[t] = u[t] - sum_k w[t,k] * fp16(h).
-    //    h is rounded to fp16 (rtne) once per chunk before the dot;
-    //    reduction over K=128 is the 8 k-slice shfl.
-    //    The UNGATED v_raw is stored to v_new (fp16 rtne) here, BEFORE
-    //    gating -- chunk_fwd_o consumes the ungated v_new.
+    // 2. Round h to fp16 for the v-correction dot.
     __half h_fp16[16];
 #pragma unroll
     for (int j = 0; j < 16; ++j) h_fp16[j] = __float2half_rn(hreg[j]);
 
-    float v_corr[GDN_BT];
-#pragma unroll
-    for (int t = 0; t < t_len; ++t) {
-      float acc = 0.0f;
-      const __half* p_wt = p_w + (long)t * H * GDN_K;
-#pragma unroll
-      for (int j = 0; j < 8; ++j) {
-        const __half2 a = gdn_load_f16x2(p_wt + 2 * j);
-        const __half2 b =
-            __halves2half2(h_fp16[2 * j], h_fp16[2 * j + 1]);
-        acc = gdn_fdot2(a, b, acc);
-      }
-      acc = gdn_ksum(acc);
-      const float u_val =
-          v_ok ? __half2float(p_u[(long)t * H * GDN_V]) : 0.0f;
-      const float v_raw = u_val - acc;
-      v_corr[t] = v_raw;
-      // Persist UNGATED v_new (fp16, rtne). Invalid v-rows skip the
-      // store but still need the dot + shfl for warp uniformity.
-      if (v_ok) p_vnew[(long)t * H * GDN_V] = __float2half_rn(v_raw);
-    }
-    for (int t = t_len; t < GDN_BT; ++t) v_corr[t] = 0.0f;
-
-    // 3. USE_G gating. g_last is the cumulative gate at the last valid
-    //    token of this chunk; v_corr is scaled by exp(g_last - g[t])
-    //    (zero for tail tokens since v_corr[t] == 0 there), and h is
-    //    scaled by exp(g_last). p_g is advanced per chunk (below), so the
-    //    gate is indexed chunk-locally (t), not by the global token.
+    // 3. Apply USE_G decay to hreg (exp(g_last), same as original). Per-t
+    //    v_corr gating (exp(g_last - g[t])) moves inline into the interleaved
+    //    loop below, eliminating the v_corr[64] spill array.
     const float g_last = p_g[(long)(t_len - 1) * H];
-    for (int t = 0; t < t_len; ++t) {
-      const float g_t = p_g[(long)t * H];
-      v_corr[t] *= expf(g_last - g_t);
-    }
     const float decay = expf(g_last);
 #pragma unroll
     for (int j = 0; j < 16; ++j) hreg[j] *= decay;
 
-    // 4. h-update: h[o_v, k0+j] += sum_t k[t, k0+j] * fp16(v_corr[t]).
-    //    v_corr (fp32, gated) is rounded to fp16 (rtne) before the dot.
-    //    Pairing over t matches Triton's V_DOT2 lowering of
-    //    tl.dot(b_k, b_v) with fp16 operands; each thread owns its
-    //    16 h elements, no shfl.
+    // 4. Interleaved per t-pair: v-correction (ungated) -> store v_new
+    //    -> gate -> h-update. v_corr is 2 scalars (v_corr0, v_corr1),
+    //    not a 64-element array. expf and fdot2 ordering match the
+    //    original t-by-t sequence -> bit-identical fp32 results.
 #pragma unroll
     for (int tp = 0; tp < GDN_BT / 2; ++tp) {
       const int t0 = 2 * tp;
-      const __half2 vb = __halves2half2(__float2half_rn(v_corr[t0]),
-                                        __float2half_rn(v_corr[t0 + 1]));
-      __half2 a0[8], a1[8];
+      const int t1 = t0 + 1;
       const bool valid0 = (t0 < t_len);
-      const bool valid1 = (t0 + 1 < t_len);
-      if (valid0) {
-        const __half* p_k0 = p_k + (long)t0 * Hg * GDN_K;
+      const bool valid1 = (t1 < t_len);
+
+      float acc0 = 0.0f, acc1 = 0.0f;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) a0[j] = gdn_load_f16x2(p_k0 + 2 * j);
-      } else {
+      for (int j = 0; j < 8; ++j) {
+        const __half2 h_pair =
+            __halves2half2(h_fp16[2 * j], h_fp16[2 * j + 1]);
+        if (valid0) {
+          const __half2 w0 =
+              gdn_load_f16x2(p_w + (long)t0 * H * GDN_K + 2 * j);
+          acc0 = gdn_fdot2(w0, h_pair, acc0);
+        }
+        if (valid1) {
+          const __half2 w1 =
+              gdn_load_f16x2(p_w + (long)t1 * H * GDN_K + 2 * j);
+          acc1 = gdn_fdot2(w1, h_pair, acc1);
+        }
+      }
+      acc0 = gdn_ksum(acc0);
+      acc1 = gdn_ksum(acc1);
+      const float u0 = (v_ok && valid0)
+                            ? __half2float(p_u[(long)t0 * H * GDN_V])
+                            : 0.0f;
+      const float u1 = (v_ok && valid1)
+                            ? __half2float(p_u[(long)t1 * H * GDN_V])
+                            : 0.0f;
+      const float v_raw0 = u0 - acc0;
+      const float v_raw1 = u1 - acc1;
+
+      if (v_ok && valid0)
+        p_vnew[(long)t0 * H * GDN_V] = __float2half_rn(v_raw0);
+      if (v_ok && valid1)
+        p_vnew[(long)t1 * H * GDN_V] = __float2half_rn(v_raw1);
+
+      const float g0 = valid0 ? p_g[(long)t0 * H] : 0.0f;
+      const float g1 = valid1 ? p_g[(long)t1 * H] : 0.0f;
+      const float v_corr0 = valid0 ? v_raw0 * expf(g_last - g0) : 0.0f;
+      const float v_corr1 = valid1 ? v_raw1 * expf(g_last - g1) : 0.0f;
+
+      const __half2 vb = __halves2half2(__float2half_rn(v_corr0),
+                                        __float2half_rn(v_corr1));
+      __half2 a0[8], a1[8];
 #pragma unroll
-        for (int j = 0; j < 8; ++j)
+      for (int j = 0; j < 8; ++j) {
+        if (valid0) {
+          a0[j] = gdn_load_f16x2(p_k + (long)t0 * Hg * GDN_K + 2 * j);
+        } else {
           a0[j] = __halves2half2(__float2half_rn(0.0f),
                                  __float2half_rn(0.0f));
-      }
-      if (valid1) {
-        const __half* p_k1 = p_k + (long)(t0 + 1) * Hg * GDN_K;
-#pragma unroll
-        for (int j = 0; j < 8; ++j) a1[j] = gdn_load_f16x2(p_k1 + 2 * j);
-      } else {
-#pragma unroll
-        for (int j = 0; j < 8; ++j)
+        }
+        if (valid1) {
+          a1[j] = gdn_load_f16x2(p_k + (long)t1 * Hg * GDN_K + 2 * j);
+        } else {
           a1[j] = __halves2half2(__float2half_rn(0.0f),
                                  __float2half_rn(0.0f));
+        }
       }
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
@@ -248,11 +247,6 @@ __global__ void __launch_bounds__(GDN_THREADS)
       }
     }
 
-    // Advance the per-chunk streaming pointers. p_h walks the 5D h chunk
-    // slots; p_k/p_w/p_u/p_vnew/p_g walk the token axis by BT so the loop
-    // body indexes chunk-locally. (Previously only p_h advanced, so chunks
-    // i_t >= 1 re-read chunk 0's k/w/u and blew up via the (I - k0^T w0)
-    // feedback.)
     p_h += stride_h;
     p_k += (long)GDN_BT * Hg * GDN_K;
     p_w += (long)GDN_BT * H * GDN_K;
