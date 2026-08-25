@@ -375,3 +375,29 @@ def test_vit_attention_backend_selection(
         head_size=128, dtype=torch.float16
     )
     assert backend == expected_backend
+
+
+@pytest.mark.parametrize(
+    "on_gfx10x_val, expected_first",
+    [
+        # RDNA2: FA-RDNA2 HIP backend preferred (handles non-pow2 block sizes
+        # like Qwen3.5/3.8 hybrids' 784, which the C++ op cannot).
+        (True, AttentionBackendEnum.RDNA_ATTN),
+        # Non-RDNA2: unchanged — ROCm attention backend first.
+        (False, AttentionBackendEnum.ROCM_ATTN),
+    ],
+)
+def test_rdna_attn_auto_selection_priority(on_gfx10x_val, expected_first, monkeypatch):
+    """Test RDNA_ATTN is auto-selected first on gfx10x in backend priorities."""
+    from vllm import _aiter_ops
+    from vllm.platforms import rocm
+
+    monkeypatch.setattr(rocm, "on_gfx10x", lambda: on_gfx10x_val)
+    # Stub aiter checks so _get_backend_priorities doesn't import heavy modules.
+    monkeypatch.setattr(_aiter_ops.rocm_aiter_ops, "is_mha_enabled", lambda: False)
+    monkeypatch.setattr(_aiter_ops, "is_aiter_found_and_supported", lambda: False)
+
+    priorities = rocm._get_backend_priorities(
+        use_mla=False, use_sparse=False, use_kv_connector=False
+    )
+    assert priorities[0] == expected_first

@@ -473,6 +473,12 @@ def _get_backend_priorities(
     # Keep ROCM_ATTN disabled for KV connectors until connector transfer
     # semantics are validated for its asymmetric native K/V cache views.
     if not use_kv_connector:
+        # RDNA2 (gfx10x): prefer the FA-RDNA2 HIP backend. Its paged
+        # decode/prefill kernels take block_size as a runtime argument and
+        # support the non-pow2 block sizes Qwen3.5/3.8 hybrids use (784,
+        # 1056), which the C++ paged_attention op (16/32 only) rejects.
+        if on_gfx10x():
+            backends.append(AttentionBackendEnum.RDNA_ATTN)
         backends.append(AttentionBackendEnum.ROCM_ATTN)
     if rocm_aiter_ops.is_mha_enabled():
         backends.append(AttentionBackendEnum.ROCM_AITER_FA)
