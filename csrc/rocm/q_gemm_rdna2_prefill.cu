@@ -88,7 +88,8 @@ __global__ __launch_bounds__(Config::THREADS) void gemm_static_kernel(
     const uint32_t* __restrict__ b_qzeros, const half* __restrict__ b_scales,
     half* __restrict__ c, const int size_m, const int size_n,
     const int size_k, const int groups, const int zero_offset,
-    const int* __restrict__ b_q_perm, const int split_k) {
+    const int* __restrict__ b_q_perm, const int split_k,
+    float* __restrict__ partials) {
   constexpr int k_per_split = K_PER_SPLIT;
   constexpr int THREADS = Config::THREADS;
   constexpr int N_PER_THREAD = Config::N_PER_THREAD;
@@ -199,7 +200,12 @@ __global__ __launch_bounds__(Config::THREADS) void gemm_static_kernel(
 
       k += K_STEP;
     }
-    epilogue<Config::M_TILE>(block_c, m_tile, size_m, size_n, n, c);
+    if (partials != nullptr) {
+      epilogue_partial<Config::M_TILE>(block_c, m_tile, size_m, size_n, n,
+                                       k_split, partials);
+    } else {
+      epilogue<Config::M_TILE>(block_c, m_tile, size_m, size_n, n, c);
+    }
   }
 }
 
@@ -214,7 +220,8 @@ __global__ __launch_bounds__(Config::THREADS) void gemm_dynamic_kernel(
     const uint32_t* __restrict__ b_qzeros, const half* __restrict__ b_scales,
     half* __restrict__ c, const int size_m, const int size_n,
     const int size_k, const int groups, const int zero_offset,
-    const int* __restrict__ b_q_perm, const int split_k) {
+    const int* __restrict__ b_q_perm, const int split_k,
+    float* __restrict__ partials) {
   constexpr int THREADS = Config::THREADS;
   constexpr int N_PER_THREAD = Config::N_PER_THREAD;
   constexpr int N_TILE = Config::N_TILE;
@@ -348,7 +355,12 @@ __global__ __launch_bounds__(Config::THREADS) void gemm_dynamic_kernel(
 
       k += K_STEP;
     }
-    epilogue<Config::M_TILE>(block_c, m_tile, size_m, size_n, n, c);
+    if (partials != nullptr) {
+      epilogue_partial<Config::M_TILE>(block_c, m_tile, size_m, size_n, n,
+                                       k_split, partials);
+    } else {
+      epilogue<Config::M_TILE>(block_c, m_tile, size_m, size_n, n, c);
+    }
   }
 }
 
@@ -359,12 +371,14 @@ __global__ __launch_bounds__(Config::THREADS) void gemm_dynamic_kernel(
 template <typename Config, int K_PER_SPLIT>
 __global__ __launch_bounds__(Config::THREADS) void gemm_static_kernel(
     const half*, const uint32_t*, const uint32_t*, const half*, half*, const int,
-    const int, const int, const int, const int, const int*, const int) {}
+    const int, const int, const int, const int, const int*, const int,
+    const float*) {}
 
 template <typename Config>
 __global__ __launch_bounds__(Config::THREADS) void gemm_dynamic_kernel(
     const half*, const uint32_t*, const uint32_t*, const half*, half*, const int,
-    const int, const int, const int, const int, const int*, const int) {}
+    const int, const int, const int, const int, const int*, const int,
+    const float*) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
@@ -390,37 +404,61 @@ inline void launch_for_config(
 
   const int zero_offset = use_v2_format ? 0 : 1;
   dim3 block(Config::THREADS);
+  // The kernels step K in increments of Config::K_STEP and prefetch one
+  // K_STEP chunk past the last element; if k_per_split is not a multiple of
+  // K_STEP the tail iteration reads past the (k_start..k_end) window and can
+  // touch qweight rows beyond size_k (nondeterministic out-of-bounds read).
+  // Shrink split_k until k_per_split aligns to K_STEP.
+  while (split_k > 1 && ((size_k / split_k) % Config::K_STEP) != 0) split_k /= 2;
   dim3 grid((size_n + N_TILE - 1) / N_TILE, (size_m + M_TILE - 1) / M_TILE,
             split_k);
   const int k_per_split = size_k / split_k;
   const int lds_k_stride = ((k_per_split + LDS_PAD + 7) / 8) * 8;
   const size_t shmem = M_TILE * lds_k_stride * sizeof(half);
 
+  float* partials = nullptr;
+  if (split_k > 1) {
+    // Multi-split launch: deterministic two-phase epilogue. Each split
+    // writes disjoint fp32 partials; a fixed-order reduce kernel sums them
+    // to fp16, so the result cannot depend on block scheduling order.
+    hipMallocAsync(reinterpret_cast<void**>(&partials),
+                   (size_t)split_k * (size_t)size_m * (size_t)size_n * sizeof(float),
+                   stream);
+  }
+
   switch (k_per_split) {
     case 256:
       gemm_static_kernel<Config, 256>
           <<<grid, block, shmem, stream>>>(a, b_q_weight, b_qzeros, b_scales, c,
                                            size_m, size_n, size_k, groups,
-                                           zero_offset, b_q_perm, split_k);
+                                           zero_offset, b_q_perm, split_k, partials);
       break;
     case 512:
       gemm_static_kernel<Config, 512>
           <<<grid, block, shmem, stream>>>(a, b_q_weight, b_qzeros, b_scales, c,
                                            size_m, size_n, size_k, groups,
-                                           zero_offset, b_q_perm, split_k);
+                                           zero_offset, b_q_perm, split_k, partials);
       break;
     case 1024:
       gemm_static_kernel<Config, 1024>
           <<<grid, block, shmem, stream>>>(a, b_q_weight, b_qzeros, b_scales, c,
                                            size_m, size_n, size_k, groups,
-                                           zero_offset, b_q_perm, split_k);
+                                           zero_offset, b_q_perm, split_k, partials);
       break;
     default:
       gemm_dynamic_kernel<Config>
           <<<grid, block, shmem, stream>>>(a, b_q_weight, b_qzeros, b_scales, c,
                                            size_m, size_n, size_k, groups,
-                                           zero_offset, b_q_perm, split_k);
+                                           zero_offset, b_q_perm, split_k, partials);
       break;
+  }
+
+  if (split_k > 1) {
+    const int total = size_m * size_n;
+    const int rblock = 256;
+    reduce_split_partials_kernel<><<<(total + rblock - 1) / rblock, rblock, 0,
+                                     stream>>>(partials, c, size_m, size_n, split_k);
+    hipFreeAsync(partials, stream);
   }
 }
 

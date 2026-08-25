@@ -61,7 +61,8 @@ __global__ void gemm_q4_kernel_rdna2(
     const T* __restrict__ a, const uint32_t* __restrict__ b_q_weight,
     const uint32_t* __restrict__ b_qzeros, const T* __restrict__ b_scales,
     T* __restrict__ c, const int size_m, const int size_n, const int size_k,
-    const int groups, const int zero_offset, const int* __restrict__ b_q_perm) {
+    const int groups, const int zero_offset, const int* __restrict__ b_q_perm,
+    float* __restrict__ partials) {
   const int t = threadIdx.x;
   const int offset_n = blockIdx.x * BLOCK_KN_SIZE * 4;
   const int offset_m = blockIdx.y * M_COUNT;
@@ -172,9 +173,17 @@ __global__ void gemm_q4_kernel_rdna2(
     k += 32;  // 4 weight words * 8 nibbles = 32 K elements
   }
 
-  // Pack partial sums into two half2 pairs and atomically add to the
-  // zero-initialized fp16 output.
-  epilogue<M_COUNT>(block_c, offset_m, size_m, size_n, n, c);
+  // Pack partial sums. In the single-split case the output tensor is
+  // zero-initialized and each block atomically adds its result. For
+  // multi-split (partials != nullptr) we instead write disjoint fp32
+  // partials and let the fixed-order reduce kernel finish, so the result
+  // does not depend on block/atomic scheduling order.
+  if (partials != nullptr) {
+    epilogue_partial<M_COUNT>(block_c, offset_m, size_m, size_n, n, blockIdx.z,
+                              partials);
+  } else {
+    epilogue<M_COUNT>(block_c, offset_m, size_m, size_n, n, c);
+  }
 }
 
 #else  // non-RDNA2 device pass: empty __global__ for symbol parity.
@@ -183,7 +192,7 @@ template <typename T, int M_COUNT>
 __global__ void gemm_q4_kernel_rdna2(const T*, const uint32_t*, const uint32_t*,
     const T*, T*, const int, const int,
     const int, const int, const int,
-    const int*) {}
+    const int*, const float*) {}
 
 #endif  // __HIP__RDNA2__ || !__HIP_DEVICE_COMPILE__
 
@@ -202,9 +211,30 @@ void launch_gemm_q4_for_mcount(const T* a, const uint32_t* b_q_weight,
             (size_m + M_COUNT - 1) / M_COUNT,
             (size_k + BLOCK_KN_SIZE - 1) / BLOCK_KN_SIZE);
 
-  gemm_q4_kernel_rdna2<T, M_COUNT><<<grid, block, 0, stream>>>(
-      a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
-      zero_offset, b_q_perm);
+  const int num_splits = grid.z;
+  if (num_splits > 1) {
+    // Multi-K-block launch: deterministic two-phase epilogue. Each split
+    // writes fp32 partials; a fixed-order reduce sums them to fp16.
+    float* partials = nullptr;
+    hipMallocAsync(reinterpret_cast<void**>(&partials),
+                   (size_t)num_splits * size_m * size_n * sizeof(float),
+                   stream);
+    gemm_q4_kernel_rdna2<T, M_COUNT><<<grid, block, 0, stream>>>(
+        a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
+        zero_offset, b_q_perm, partials);
+    const int total = size_m * size_n;
+    const int rblock = 256;
+    reduce_split_partials_kernel<><<<(total + rblock - 1) / rblock, rblock, 0,
+                                     stream>>>(partials, c, size_m, size_n,
+                                                num_splits);
+    hipFreeAsync(partials, stream);
+  } else {
+    // Single split: zero-initialized output + packed-fp16 atomic add is
+    // a deterministic single-accumulator path (no order to race).
+    gemm_q4_kernel_rdna2<T, M_COUNT><<<grid, block, 0, stream>>>(
+        a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
+        zero_offset, b_q_perm, nullptr);
+  }
 }
 // Dispatch to the largest M_COUNT template that tiles size_m without wasting
 // more than half the last tile. M_COUNT is capped at 8; the kernel still

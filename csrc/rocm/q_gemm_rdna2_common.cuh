@@ -135,6 +135,56 @@ __forceinline__ __device__ void epilogue(
   }
 }
 
+// Deterministic epilogue for multi-split (Z > 1) launches. Each K-split
+// block writes its fp32 partial results to its OWN disjoint slot
+// [z, m, n] — a plain (non-atomic) store, since (z, m, n) is unique to a
+// single block. A later fixed-order reduce kernel (reduce_split_partials)
+// sums splits z = 0..Z-1 and rounds to fp16 exactly once.
+//
+// Why: the packed-fp16 CAS epilogue (above) makes the inter-split
+// accumulation order-dependent (fp16 addition is not associative + the CAS
+// arrival order races), so multi-K-block launches produced run-to-run
+// nondeterministic results. Saving fp32 partials and reducing in a fixed
+// order makes the result deterministic (IEEE fp32 add is order-stable when
+// the order is fixed).
+template <int M_TILE>
+__forceinline__ __device__ void epilogue_partial(
+    const float block_c[M_TILE][4], int m_tile, int size_m, int size_n,
+    int n, int split_idx, float* partials) {
+  #pragma unroll
+  for (int m = 0; m < M_TILE; ++m) {
+    const int m_row = m_tile + m;
+    if (m_row >= size_m) continue;
+    float* p = partials + split_idx * size_m * size_n + m_row * size_n + n;
+    p[0] = block_c[m][0];
+    p[1] = block_c[m][1];
+    p[2] = block_c[m][2];
+    p[3] = block_c[m][3];
+  }
+}
+
+// Deterministic reduce of per-split fp32 partials into the fp16 output.
+// One thread per output element; sums Z splits in fixed order z=0..Z-1 in
+// fp32 and rounds to fp16 exactly once. The fixed order makes the result
+// bit-reproducible across launches (fp32 add in a fixed order is
+// deterministic), unlike the packed-fp16 CAS epilogue used for single-split
+// launches.
+template <int _Unused = 0>
+__global__ void reduce_split_partials_kernel(
+    const float* __restrict__ partials, half* __restrict__ c, int size_m,
+    int size_n, int num_splits) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = size_m * size_n;
+  if (idx >= total) return;
+  const int m = idx / size_n;
+  const int n = idx % size_n;
+  float acc = 0.0f;
+  for (int z = 0; z < num_splits; ++z) {
+    acc += partials[(z * size_m + m) * size_n + n];
+  }
+  c[idx] = __float2half_rn(acc);
+}
+
 }  // namespace gptq_rdna2
 }  // namespace vllm
 
