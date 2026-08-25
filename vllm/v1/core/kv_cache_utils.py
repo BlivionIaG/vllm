@@ -1365,6 +1365,26 @@ def _get_kv_cache_config_packed(
     return num_blocks, kv_cache_tensors
 
 
+def _is_mixed_stateful_attention_hybrid(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> bool:
+    """True when a model mixes stateful (GDN/Mamba) and attention cache
+    groups. The pooled layout shares one slab between one layer of every
+    group; stateful layers index the slab by state-slot while attention
+    layers index it by block id, and with per-group page sizes the two
+    views can alias. Such models need per-group tensors instead."""
+    has_stateful = any(
+        isinstance(group.kv_cache_spec, MambaSpec) for group in kv_cache_groups
+    )
+    if not has_stateful:
+        return False
+    has_attention = any(
+        isinstance(group.kv_cache_spec, AttentionSpec)
+        for group in kv_cache_groups
+    )
+    return has_attention
+
+
 def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -1434,14 +1454,35 @@ def get_kv_cache_config_from_groups(
             vllm_config, group_size, available_memory, page_size
         )
         kv_cache_tensors = []
-        for i in range(group_size):
-            shared_by = []
-            for j in range(len(kv_cache_groups)):
-                if i < len(kv_cache_groups[j].layer_names):
-                    shared_by.append(kv_cache_groups[j].layer_names[i])
-            kv_cache_tensors.append(
-                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
-            )
+        if _is_mixed_stateful_attention_hybrid(kv_cache_groups):
+            # GDN / Mamba state layers and attention layers must not share a
+            # single physical slab. In the pooled layout each tensor holds
+            # one layer per group at the same byte offset; stateful layers
+            # index the slab by state-slot while attention layers index it by
+            # block id, and with per-group page sizes that differ only by the
+            # conv prefix the two views can alias the same bytes (GDN writes
+            # clobber attention KV pages -> NaN). Give each group its own
+            # tensor so the two cache types can never overlap.
+            for group in kv_cache_groups:
+                group_blocks = get_num_blocks(
+                    vllm_config, len(group.layer_names), available_memory,
+                    page_size
+                )
+                kv_cache_tensors.append(
+                    KVCacheTensor(
+                        size=page_size * group_blocks,
+                        shared_by=list(group.layer_names),
+                    )
+                )
+        else:
+            for i in range(group_size):
+                shared_by = []
+                for j in range(len(kv_cache_groups)):
+                    if i < len(kv_cache_groups[j].layer_names):
+                        shared_by.append(kv_cache_groups[j].layer_names[i])
+                kv_cache_tensors.append(
+                    KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+                )
 
     return KVCacheConfig(
         num_blocks=num_blocks,

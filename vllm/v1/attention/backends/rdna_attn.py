@@ -660,6 +660,13 @@ class RdnaAttentionBackend(AttentionBackend):
 
     supported_kv_cache_dtypes = ["auto", "float16", "bfloat16", "fp8", "int8_per_token_head"]
 
+    # KV cache is written by do_kv_cache_update() (called via the
+    # unified_kv_cache_update op), not inside the attention forward itself.
+    # Must mirror RocmAttentionBackend: inheriting True from the base would
+    # skip the cache write entirely, leaving the paged KV cache uninitialized
+    # (garbage/NaN on first prefill).
+    forward_includes_kv_cache_update: bool = False
+
     @classmethod
     def supports_per_head_quant_scales(cls) -> bool:
         return True
