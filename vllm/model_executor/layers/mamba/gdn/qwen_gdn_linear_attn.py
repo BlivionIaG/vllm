@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
+import os
 from typing import Literal
 
 import torch
@@ -1505,6 +1506,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 b_prefill = b_non_spec
 
             if _gdn_prefill_dispatch_available():
+                if os.environ.get("VLLM_LOG_GDN_DISPATCH") == "1" and not torch.compiler.is_compiling():
+                    print(f"[gdn-dispatch] {self.prefix} PREFILL -> HIP chain", flush=True)
                 _L = conv_output_prefill.shape[0]
                 _HV = self.num_v_heads // self.tp_size
                 _H = self.num_k_heads // self.tp_size
@@ -1526,6 +1529,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     attn_metadata.chunk_indices,
                 )
             else:
+                if os.environ.get("VLLM_LOG_GDN_DISPATCH") == "1" and not torch.compiler.is_compiling():
+                    print(f"[gdn-dispatch] {self.prefix} PREFILL -> TRITON", flush=True)
                 (
                     query_non_spec,
                     key_non_spec,
@@ -1585,25 +1590,51 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.2: Process non-spec-decode part
         if split_non_spec:
-            query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
-                mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
-            )
-            core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
-                A_log=self.A_log,
-                a=a[:num_decode_tokens],
-                b=b[:num_decode_tokens],
-                dt_bias=self.dt_bias,
-                q=query_decode,
-                k=key_decode,
-                v=value_decode,
-                initial_state=ssm_state,
-                inplace_final_state=True,
-                cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
-                    : attn_metadata.num_decodes + 1
-                ],
-                ssm_state_indices=non_spec_state_indices_tensor,
-                use_qk_l2norm_in_kernel=True,
-            )
+            if self._can_hip_gdn_decode(mixed_qkv_non_spec.dtype, ssm_state.dtype):
+                if os.environ.get("VLLM_LOG_GDN_DISPATCH") == "1" and not torch.compiler.is_compiling():
+                    print(f"[gdn-dispatch] {self.prefix} MIXED-DECODE -> HIP gdn_decode_rdna2", flush=True)
+                out_decode = torch.empty(
+                    num_decode_tokens,
+                    1,
+                    self.num_v_heads // self.tp_size,
+                    self.head_v_dim,
+                    dtype=mixed_qkv_non_spec.dtype,
+                    device=mixed_qkv_non_spec.device,
+                )
+                torch.ops._rocm_C.gdn_decode_rdna2(
+                    mixed_qkv_non_spec[:num_decode_tokens],
+                    a[:num_decode_tokens],
+                    b[:num_decode_tokens],
+                    self.A_log,
+                    self.dt_bias,
+                    out_decode,
+                    ssm_state,
+                    non_spec_state_indices_tensor[:num_decode_tokens],
+                    self.head_k_dim**-0.5,
+                    True,
+                )
+                # downstream concat expects [1, num_decode_tokens, HV, V]
+                core_attn_out_decode = out_decode.transpose(0, 1)
+            else:
+                query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
+                    mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
+                )
+                core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
+                    A_log=self.A_log,
+                    a=a[:num_decode_tokens],
+                    b=b[:num_decode_tokens],
+                    dt_bias=self.dt_bias,
+                    q=query_decode,
+                    k=key_decode,
+                    v=value_decode,
+                    initial_state=ssm_state,
+                    inplace_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+                        : attn_metadata.num_decodes + 1
+                    ],
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                    use_qk_l2norm_in_kernel=True,
+                )
         else:
             core_attn_out_decode = None
 
@@ -1763,6 +1794,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out.reshape(-1),
         )
 
+    def _can_hip_gdn_decode(
+        self, qkv_dtype: torch.dtype, state_dtype: torch.dtype
+    ) -> bool:
+        if not current_platform.is_rocm() or self.head_k_dim != 128:
+            return False
+        if qkv_dtype != torch.float16 or state_dtype != torch.float32:
+            return False
+        from vllm.platforms.rocm import on_gfx10x
+
+        return (
+            on_gfx10x()
+            and hasattr(torch.ops, "_rocm_C")
+            and hasattr(torch.ops._rocm_C, "gdn_decode_rdna2")
+        )
+
     def _forward_core_decode_non_spec(
         self,
         mixed_qkv: torch.Tensor,
@@ -1804,30 +1850,26 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         if (
-            current_platform.is_rocm()
-            and self.head_k_dim == 128
-            and mixed_qkv_non_spec.dtype == torch.float16
-            and ssm_state.dtype == torch.float32
-            and out_buf.dtype == torch.float16
+            out_buf.dtype == torch.float16
+            and self._can_hip_gdn_decode(mixed_qkv_non_spec.dtype, ssm_state.dtype)
         ):
-            from vllm.platforms.rocm import on_gfx10x
-
-            if on_gfx10x() and hasattr(torch.ops, "_rocm_C") and hasattr(
-                torch.ops._rocm_C, "gdn_decode_rdna2"
-            ):
-                torch.ops._rocm_C.gdn_decode_rdna2(
-                    mixed_qkv_non_spec,
-                    a,
-                    b,
-                    self.A_log,
-                    self.dt_bias,
-                    out_buf,
-                    ssm_state,
-                    non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
-                    self.head_k_dim**-0.5,
-                    True,
-                )
-                return
+            if os.environ.get("VLLM_LOG_GDN_DISPATCH") == "1" and not torch.compiler.is_compiling():
+                print(f"[gdn-dispatch] {self.prefix} DECODE -> HIP gdn_decode_rdna2", flush=True)
+            torch.ops._rocm_C.gdn_decode_rdna2(
+                mixed_qkv_non_spec,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                out_buf,
+                ssm_state,
+                non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
+                self.head_k_dim**-0.5,
+                True,
+            )
+            return
+        if os.environ.get("VLLM_LOG_GDN_DISPATCH") == "1" and not torch.compiler.is_compiling():
+            print(f"[gdn-dispatch] {self.prefix} DECODE -> TRITON fused_recurrent", flush=True)
         fused_recurrent_gated_delta_rule_packed_decode(
             mixed_qkv=mixed_qkv_non_spec,
             a=a,
