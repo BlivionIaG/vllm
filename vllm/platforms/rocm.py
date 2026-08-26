@@ -774,7 +774,13 @@ class RocmPlatform(Platform):
         """
         Query if the set of gpus are fully connected by xgmi (1 hop)
         """
-        handles = [amdsmi_get_processor_handles()[i] for i in physical_device_ids]
+        handles_all = amdsmi_get_processor_handles()
+        try:
+            handles = [handles_all[i] for i in physical_device_ids]
+        except IndexError:
+            # amdsmi may enumerate fewer GPUs than the HIP runtime
+            # (seen on 5x V620 gfx1030) — don't crash the AR init.
+            return False
         for i, handle in enumerate(handles):
             for j, peer_handle in enumerate(handles):
                 if i < j:
@@ -961,7 +967,10 @@ class RocmPlatform(Platform):
 
     @classmethod
     def use_custom_allreduce(cls) -> bool:
-        # We only enable custom allreduce for MI300 series
+        # We only enable custom allreduce for MI300 series, plus opt-in via
+        # VLLM_FORCE_CUSTOM_ALL_REDUCE (see envs.py).
+        if envs.VLLM_FORCE_CUSTOM_ALL_REDUCE:
+            return True
         return any(gfx in _GCN_ARCH for gfx in ["gfx94", "gfx95"])
 
     @classmethod

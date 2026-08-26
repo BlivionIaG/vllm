@@ -177,12 +177,18 @@ class CustomAllreduce:
             assert current_platform.is_cuda_alike()
             fully_connected = current_platform.is_fully_connected(physical_device_ids)
         if same_node and world_size > 2 and not fully_connected:
+            if not envs.VLLM_FORCE_CUSTOM_ALL_REDUCE:
+                logger.warning(
+                    "Custom allreduce is disabled because it's not supported on"
+                    " more than two PCIe-only GPUs. To silence this warning, "
+                    "specify disable_custom_all_reduce=True explicitly."
+                )
+                return
             logger.warning(
-                "Custom allreduce is disabled because it's not supported on"
-                " more than two PCIe-only GPUs. To silence this warning, "
-                "specify disable_custom_all_reduce=True explicitly."
+                "Custom allreduce force-enabled on %d PCIe-only GPUs by "
+                "VLLM_FORCE_CUSTOM_ALL_REDUCE=1 (bypassing XGMI-topology "
+                "gate).", world_size,
             )
-            return
         # test P2P capability, this checks software/cudaruntime support
         # this is expensive to compute at the first time
         # then we cache the result
@@ -355,8 +361,13 @@ class CustomAllreduce:
         if not is_weak_contiguous(inp):
             return False
         # for 4 or more non NVLink-capable GPUs, custom allreduce provides
-        # little performance improvement over NCCL.
-        if self.world_size == 2 or self.fully_connected:
+        # little performance improvement over NCCL (a large-message heuristic;
+        # small decode messages still win — VLLM_FORCE_CUSTOM_ALL_REDUCE).
+        if (
+            self.world_size == 2
+            or self.fully_connected
+            or envs.VLLM_FORCE_CUSTOM_ALL_REDUCE
+        ):
             return inp_size < self.max_size
         return False
 

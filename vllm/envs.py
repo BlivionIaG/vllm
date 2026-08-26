@@ -124,6 +124,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_DISABLE_CUSTOM_ALL_REDUCE: bool = False
+    VLLM_FORCE_CUSTOM_ALL_REDUCE: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
@@ -1164,6 +1165,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # is CUDA-only and cannot dispatch on HIP.
     "VLLM_DISABLE_CUSTOM_ALL_REDUCE": lambda: (
         os.getenv("VLLM_DISABLE_CUSTOM_ALL_REDUCE", "False").lower()
+        in ("true", "1")
+    ),
+    # Bypass the "no more than two PCIe-only GPUs" XGMI-topology gate in
+    # CustomAllreduce. For RDNA systems where PCIe P2P actually works
+    # (P2PDMA-enabled kernel); init fails loudly if P2P is broken.
+    "VLLM_FORCE_CUSTOM_ALL_REDUCE": lambda: (
+        os.getenv("VLLM_FORCE_CUSTOM_ALL_REDUCE", "False").lower()
         in ("true", "1")
     ),
     # List of quantization kernels that should be disabled, used for testing
