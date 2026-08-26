@@ -1455,6 +1455,9 @@ def get_kv_cache_config_from_groups(
         )
         kv_cache_tensors = []
         if _is_mixed_stateful_attention_hybrid(kv_cache_groups):
+            import os as _os
+            _spec_types = [(type(g.kv_cache_spec).__name__, len(g.layer_names)) for g in kv_cache_groups]
+            print(f"[KVSPEC-DBG] mixed_hybrid=True groups={_spec_types} num_blocks={num_blocks if 'num_blocks' in dir() else '?'}", flush=True)
             # GDN / Mamba state layers and attention layers must not share a
             # single physical slab. In the pooled layout each tensor holds
             # one layer per group at the same byte offset; stateful layers

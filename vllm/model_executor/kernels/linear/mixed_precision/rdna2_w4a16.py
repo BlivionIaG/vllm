@@ -19,6 +19,8 @@ Registered ahead of TritonW4A16LinearKernel for the ROCm-RDNA2 path; falls
 through to the Triton kernel on non-RDNA2 ROCm devices (e.g. CDNA/MI300).
 """
 
+import os
+
 import torch
 
 from vllm import _custom_ops as ops
@@ -33,6 +35,12 @@ from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 
 def _rdna2_w4a16_select_kernel(m: int, k: int, n: int) -> str:
+    # Force every GEMM through the RDNA2 HIP kernel (V_DOT2 path) when the
+    # env override is set. gptq_gemm_rdna2 tiles any M via M_COUNT∈{1,2,4,8}
+    # so it is correct for prefill too; it just leaves large-M throughput
+    # on the table vs exllama. Used for full-HIP-path profiling.
+    if os.environ.get("VLLM_FORCE_RDNA2_W4A16_HIP") == "1":
+        return "rdna2_decode"
     # M > 256: exllama is the clear winner for compute-bound GEMMs.
     if m > 256:
         return "exllama"
@@ -250,6 +258,9 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
         k = x_2d.size(1)
         n = c.partition_weight_shape[1]
         kernel_name = _rdna2_w4a16_select_kernel(m, k, n)
+
+        if os.environ.get("VLLM_LOG_W4A16_DISPATCH") == "1" and not torch.compiler.is_compiling():
+            print(f"[w4a16] M={m} K={k} N={n} -> {kernel_name}", flush=True)
 
         # AWQ stores literal zeros → kernel must NOT add 1 (use_v2_format=True,
         # q_gemm_rdna2.cu:219 picks zero_offset=0). GPTQv1 stores zero-1 →
