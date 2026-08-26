@@ -137,9 +137,16 @@ def _gdn_prefill_chain_rdna2(
     return o, final_state
 
 
+def _gdn_hip_kernels_enabled() -> bool:
+    """Bisect gate: VLLM_GDN_HIP_KERNELS=0 forces the Triton/FLA fallback
+    for both GDN prefill and decode HIP paths (default: enabled)."""
+    return os.environ.get("VLLM_GDN_HIP_KERNELS", "1") != "0"
+
+
 def _gdn_prefill_dispatch_available() -> bool:
     """True iff all 5 GDN prefill HIP ops are registered for this build."""
-    return (current_platform.is_rocm() and on_gfx10x() and hasattr(
+    return (_gdn_hip_kernels_enabled() and current_platform.is_rocm()
+            and on_gfx10x() and hasattr(
         torch.ops._rocm_C, "gdn_prefill_prep_rdna2"))
 
 
@@ -1797,6 +1804,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _can_hip_gdn_decode(
         self, qkv_dtype: torch.dtype, state_dtype: torch.dtype
     ) -> bool:
+        if not _gdn_hip_kernels_enabled():
+            return False
         if not current_platform.is_rocm() or self.head_k_dim != 128:
             return False
         if qkv_dtype != torch.float16 or state_dtype != torch.float32:
