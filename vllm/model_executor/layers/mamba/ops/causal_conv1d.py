@@ -729,16 +729,20 @@ def causal_conv1d_fn(
         if _n < 8 and cache_indices is not None:
             causal_conv1d_fn._dbg_n = _n + 1
             _ci = cache_indices
+            def _rng(t):
+                if t is None or t.numel() == 0:
+                    return "None"
+                return f"min={t.min().item()} max={t.max().item()}"
             print(
                 f"[DBG-MAMBA] fwd call={_n} "
                 f"num_cache_lines={num_cache_lines} "
                 f"ci[min={_ci.min().item()} max={_ci.max().item()} "
                 f"zeros={int((_ci == 0).sum())} neg={int((_ci < 0).sum())} "
                 f"oob={int((_ci >= num_cache_lines).sum())} n={_ci.numel()}] "
-                f"last_sched[min={block_idx_last_scheduled_token.min().item()} "
-                f"max={block_idx_last_scheduled_token.max().item()}] "
-                f"init_idx[min={initial_state_idx.min().item()} "
-                f"max={initial_state_idx.max().item()}] "
+                f"last_sched[{_rng(block_idx_last_scheduled_token)}] "
+                f"first_sched[{_rng(block_idx_first_scheduled_token)}] "
+                f"init_idx[{_rng(initial_state_idx)}] "
+                f"has_init[{_rng(has_initial_state)}] "
                 f"pad_slot_id={pad_slot_id} null_block_id={null_block_id}",
                 flush=True,
             )
