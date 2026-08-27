@@ -1455,28 +1455,31 @@ def get_kv_cache_config_from_groups(
         )
         kv_cache_tensors = []
         if _is_mixed_stateful_attention_hybrid(kv_cache_groups):
-            import os as _os
-            _spec_types = [(type(g.kv_cache_spec).__name__, len(g.layer_names)) for g in kv_cache_groups]
-            print(f"[KVSPEC-DBG] mixed_hybrid=True groups={_spec_types} num_blocks={num_blocks if 'num_blocks' in dir() else '?'}", flush=True)
             # GDN / Mamba state layers and attention layers must not share a
             # single physical slab. In the pooled layout each tensor holds
             # one layer per group at the same byte offset; stateful layers
             # index the slab by state-slot while attention layers index it by
-            # block id, and with per-group page sizes that differ only by the
-            # conv prefix the two views can alias the same bytes (GDN writes
-            # clobber attention KV pages -> NaN). Give each group its own
-            # tensor so the two cache types can never overlap.
+            # block id, and the two views alias the same bytes (GDN writes
+            # clobber attention KV pages -> NaN).
+            #
+            # Layers within the SAME group also share one block table, so
+            # they use identical block/state ids. Giving the whole group one
+            # tensor therefore makes every layer in the group write the same
+            # slot and clobber each other's state (decode reads the last
+            # writer's state -> garbage tokens). Give each layer its own
+            # tensor so all layers' caches are pairwise disjoint.
+            total_kv_layers = sum(len(g.layer_names) for g in kv_cache_groups)
+            num_blocks = get_num_blocks(
+                vllm_config, total_kv_layers, available_memory, page_size
+            )
             for group in kv_cache_groups:
-                group_blocks = get_num_blocks(
-                    vllm_config, len(group.layer_names), available_memory,
-                    page_size
-                )
-                kv_cache_tensors.append(
-                    KVCacheTensor(
-                        size=page_size * group_blocks,
-                        shared_by=list(group.layer_names),
+                for layer_name in group.layer_names:
+                    kv_cache_tensors.append(
+                        KVCacheTensor(
+                            size=page_size * num_blocks,
+                            shared_by=[layer_name],
+                        )
                     )
-                )
         else:
             for i in range(group_size):
                 shared_by = []
