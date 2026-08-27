@@ -477,7 +477,10 @@ def _get_backend_priorities(
         # decode/prefill kernels take block_size as a runtime argument and
         # support the non-pow2 block sizes Qwen3.5/3.8 hybrids use (784,
         # 1056), which the C++ paged_attention op (16/32 only) rejects.
-        if on_gfx10x():
+        # Only select it when fa_rdna2 is actually enabled
+        # (VLLM_USE_RDNA2_FA=1, see use_rocm_custom_paged_attention);
+        # otherwise forward() raises NotImplementedError with no fallback.
+        if on_gfx10x() and os.environ.get("VLLM_USE_RDNA2_FA") == "1":
             backends.append(AttentionBackendEnum.RDNA_ATTN)
         backends.append(AttentionBackendEnum.ROCM_ATTN)
     if rocm_aiter_ops.is_mha_enabled():
