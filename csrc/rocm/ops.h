@@ -166,6 +166,36 @@ void mxfp4_gemm_rdna2(torch::Tensor a, torch::Tensor c,
                       torch::Tensor b_q_weight, torch::Tensor b_scales,
                       int64_t size_m, int64_t size_n, int64_t size_k);
 
+// EXL3 (QTIP-style bitshift trellis) dense GEMM kernel for AMD RDNA2/RDNA3
+// (gfx1030/gfx1100). Real tile layout [K/16, N/16, 256*bits/16] int16,
+// procedural codebook decode (cb 0=3inst default, 1=mcg) + v_dot2_f32_f16.
+// bits = bpw in {2, 3, 4}.
+void exl3_gemm_rdna2(torch::Tensor a, torch::Tensor c, torch::Tensor trellis,
+                     int64_t size_m, int64_t size_n, int64_t size_k,
+                     int64_t bits, int64_t cb);
+
+// EXL3 (QTIP-style bitshift trellis) fused MoE GEMM kernel for AMD
+// RDNA2/RDNA3 (gfx1030/gfx1100). Sorted-token-id grouping, per-expert
+// packed trellis [E, K/16, N/16, 256*bits/16], codebook decode +
+// v_dot2_f32_f16, topk-weighted atomic add epilogue.
+void moe_exl3_gemm_rdna2(torch::Tensor a, torch::Tensor c,
+                         torch::Tensor trellis, torch::Tensor topk_weights,
+                         torch::Tensor sorted_token_ids,
+                         torch::Tensor expert_ids,
+                         torch::Tensor num_tokens_post_padded,
+                         int64_t top_k, int64_t block_size_m,
+                         bool mul_topk_weight, int64_t output_topk,
+                         int64_t bits, int64_t cb);
+
+// EXL3 Hadamard-128 transform for AMD RDNA2/RDNA3 (gfx1030/gfx1100).
+// y = H_128(x) * (scale/sqrt(128)), optionally pre-scaled (suh, A-side) or
+// post-scaled (svh, C-side). Port of exllamav3_ext.had_r_128; applied
+// OUTSIDE the EXL3 K-dot (wiki kernels/exl3.md).
+void exl3_hadamard_128(torch::Tensor input, torch::Tensor output,
+                       torch::optional<torch::Tensor> pre_scale,
+                       torch::optional<torch::Tensor> post_scale,
+                       double scale);
+
 // Paged MQA logits for DeepSeek V4 Lightning Indexer on AMD RDNA2
 // (gfx1030). AITER is CDNA-only and crashes on gfx1030; this kernel
 // replaces `rocm_aiter_sparse_attn_indexer`'s paged MQA logits stage
