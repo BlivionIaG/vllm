@@ -238,17 +238,23 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 + current_last_index
             ).to(tl.int64)
 
-            conv_states_ptrs_target = (
-                conv_states_ptr
-                + (conv_states_output_coord * stride_conv_state_seq)  # Offset from seq
-                + (idx_feats * stride_conv_state_dim)
-            )[None, :] + (  # [BLOCK_N,]
-                idx_tokens_conv * stride_conv_state_tok
-            )[:, None]
+            # Bounds-check the write-back like the read path at the top of
+            # this kernel and the update-kernel write-back: an out-of-range
+            # coord would store into arbitrary device memory and corrupt
+            # neighbouring conv-state slots, which later forwards read back
+            # as garbage state.
+            if conv_states_output_coord >= 0 and conv_states_output_coord < num_cache_lines:  # noqa: E501
+                conv_states_ptrs_target = (
+                    conv_states_ptr
+                    + (conv_states_output_coord * stride_conv_state_seq)
+                    + (idx_feats * stride_conv_state_dim)
+                )[None, :] + (  # [BLOCK_N,]
+                    idx_tokens_conv * stride_conv_state_tok
+                )[:, None]
 
-            mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
-            tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
-            tl.store(conv_states_ptrs_target, loaded_x, mask)
+                mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]  # noqa: E501
+                tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
+                tl.store(conv_states_ptrs_target, loaded_x, mask)
 
         else:
             if load_init_state:
