@@ -1181,6 +1181,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         logits = self.model.compute_logits(sample_hidden_states)
+        if os.environ.get("VLLM_DBG_LOGITS") == "1":
+            _n = getattr(self, "_dbg_logits_n", 0)
+            if _n < 6:
+                self._dbg_logits_n = _n + 1
+                with torch.no_grad():
+                    _lf = logits.float()
+                    _hf = sample_hidden_states.float()
+                    print(
+                        f"[DBG-LOGITS] step={_n} shape={tuple(logits.shape)} "
+                        f"hs_norm={_hf.norm().item():.4f} "
+                        f"hs_nan={torch.isnan(_hf).sum().item()} "
+                        f"hs_absmax={_hf.abs().max().item():.4f} "
+                        f"logits_nan={torch.isnan(_lf).sum().item()} "
+                        f"logits_inf={torch.isinf(_lf).sum().item()} "
+                        f"logits_absmax={_lf.abs().max().item():.4f} "
+                        f"top5={torch.topk(_lf[0], 5).indices.tolist()}",
+                        flush=True,
+                    )
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
