@@ -1698,15 +1698,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     self._dbg_prefill_n = _pn + 1
                     _lrs = last_recurrent_state.float()
                     _wback = ssm_state[prefill_state_indices].float()
+                    _p0 = ssm_state[prefill_state_indices[0]].flatten()[:6].tolist()
                     print(
                         f"[DBG-GDNSTATE] {self.prefix} PREFILL write call={_pn} "
                         f"pf_idx[min={prefill_state_indices.min().item()} "
                         f"max={prefill_state_indices.max().item()} "
                         f"n={prefill_state_indices.numel()}] "
                         f"last_recur_norm={_lrs.norm().item():.4f} "
-                        f"last_recur_absmax={_lrs.abs().max().item():.3f} "
                         f"last_recur_nan={int(torch.isnan(_lrs).sum())} "
                         f"wback_norm={_wback.norm().item():.4f} "
+                        f"ssm_ptr={ssm_state.data_ptr()} "
+                        f"ssm_first6={[round(v, 3) for v in _p0]} "
                         f"ssm_slots={ssm_state.shape[0]}",
                         flush=True,
                     )
@@ -1872,13 +1874,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 _ok = _idx[(_idx >= 0) & (_idx < _nslots)]
                 _sel = ssm_state[_ok].float()
                 _csel = conv_state[_ok].float() if _ok.numel() else None
+                _s0 = ssm_state[_ok[0]].flatten()[:6].tolist() if _ok.numel() else []
                 print(
                     f"[DBG-GDNSTATE] {self.prefix} decode call={_n} "
                     f"ntok={num_actual_tokens} idx[min={_idx.min().item()} "
                     f"max={_idx.max().item()} n={_idx.numel()} oob={_oob}] "
                     f"ssm_slots={_nslots} ssm_norm={_sel.norm().item():.4f} "
-                    f"ssm_absmax={_sel.abs().max().item() if _ok.numel() else float('nan'):.3f} "
-                    f"ssm_nan={int(torch.isnan(_sel).sum())} "
+                    f"ssm_ptr={ssm_state.data_ptr()} "
+                    f"ssm_first6={[round(v, 3) for v in _s0]} "
                     f"conv_norm={_csel.norm().item() if _csel is not None else float('nan'):.4f}",
                     flush=True,
                 )
