@@ -5,6 +5,8 @@
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 
 
+import os
+
 import numpy as np
 import torch
 
@@ -721,6 +723,25 @@ def causal_conv1d_fn(
     if batch_ptr.device != x.device:
         batch_ptr = batch_ptr.to(x.device)
         token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
+
+    if os.environ.get("VLLM_DBG_MAMBA_IDX") == "1":
+        _n = getattr(causal_conv1d_fn, "_dbg_n", 0)
+        if _n < 8 and cache_indices is not None:
+            causal_conv1d_fn._dbg_n = _n + 1
+            _ci = cache_indices
+            print(
+                f"[DBG-MAMBA] fwd call={_n} "
+                f"num_cache_lines={num_cache_lines} "
+                f"ci[min={_ci.min().item()} max={_ci.max().item()} "
+                f"zeros={int((_ci == 0).sum())} neg={int((_ci < 0).sum())} "
+                f"oob={int((_ci >= num_cache_lines).sum())} n={_ci.numel()}] "
+                f"last_sched[min={block_idx_last_scheduled_token.min().item()} "
+                f"max={block_idx_last_scheduled_token.max().item()}] "
+                f"init_idx[min={initial_state_idx.min().item()} "
+                f"max={initial_state_idx.max().item()}] "
+                f"pad_slot_id={pad_slot_id} null_block_id={null_block_id}",
+                flush=True,
+            )
 
     _causal_conv1d_fwd_kernel[grid](
         # Pointers to matrices
