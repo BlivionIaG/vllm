@@ -1691,30 +1691,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
 
-            if os.environ.get("VLLM_DBG_GDN_STATE") == "1" and (
-                    "layers.0." in self.prefix or "layers.1." in self.prefix):
-                _pn = getattr(self, "_dbg_prefill_n", 0)
-                if _pn < 4:
-                    self._dbg_prefill_n = _pn + 1
-                    _lrs = last_recurrent_state.float()
-                    _wback = ssm_state[prefill_state_indices].float()
-                    _p0 = ssm_state[prefill_state_indices[0]].flatten()[:6].tolist()
-                    _pslotptr = ssm_state[prefill_state_indices[0]].data_ptr()
-                    print(
-                        f"[DBG-GDNSTATE] {self.prefix} PREFILL write call={_pn} "
-                        f"pf_idx[min={prefill_state_indices.min().item()} "
-                        f"max={prefill_state_indices.max().item()} "
-                        f"n={prefill_state_indices.numel()}] "
-                        f"last_recur_norm={_lrs.norm().item():.4f} "
-                        f"last_recur_nan={int(torch.isnan(_lrs).sum())} "
-                        f"wback_norm={_wback.norm().item():.4f} "
-                        f"ssm_base={ssm_state.data_ptr()} slot_ptr={_pslotptr} "
-                        f"ssm_stride={ssm_state.stride()} "
-                        f"ssm_first6={[round(v, 3) for v in _p0]} "
-                        f"ssm_slots={ssm_state.shape[0]}",
-                        flush=True,
-                    )
-
             if split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
                 # outputs (decode-first order).
@@ -1864,43 +1840,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
-
-        if os.environ.get("VLLM_DBG_GDN_PTRS") == "1":
-            if not getattr(self, "_dbg_ptr_done", False):
-                self._dbg_ptr_done = True
-                _idxv = non_spec_state_indices_tensor[:num_actual_tokens]
-                print(
-                    f"[DBG-GDNPTR] {self.prefix} ssm_ptr={ssm_state.data_ptr()} "
-                    f"conv_ptr={conv_state.data_ptr()} "
-                    f"slot_idx={_idxv.flatten()[:4].tolist()} "
-                    f"ssm_shape={tuple(ssm_state.shape)}",
-                    flush=True,
-                )
-
-        if os.environ.get("VLLM_DBG_GDN_STATE") == "1" and (
-                "layers.0." in self.prefix or "layers.1." in self.prefix):
-            _n = getattr(self, "_dbg_state_n", 0)
-            if _n < 8:
-                self._dbg_state_n = _n + 1
-                _idx = non_spec_state_indices_tensor[:num_actual_tokens]
-                _nslots = ssm_state.shape[0]
-                _oob = int((_idx >= _nslots).sum()) + int((_idx < 0).sum())
-                _ok = _idx[(_idx >= 0) & (_idx < _nslots)]
-                _sel = ssm_state[_ok].float()
-                _csel = conv_state[_ok].float() if _ok.numel() else None
-                _s0 = ssm_state[_ok[0]].flatten()[:6].tolist() if _ok.numel() else []
-                _slotptr = ssm_state[_ok[0]].data_ptr() if _ok.numel() else 0
-                print(
-                    f"[DBG-GDNSTATE] {self.prefix} decode call={_n} "
-                    f"ntok={num_actual_tokens} idx[min={_idx.min().item()} "
-                    f"max={_idx.max().item()} n={_idx.numel()} oob={_oob}] "
-                    f"ssm_slots={_nslots} ssm_norm={_sel.norm().item():.4f} "
-                    f"ssm_base={ssm_state.data_ptr()} slot_ptr={_slotptr} "
-                    f"ssm_stride={ssm_state.stride()} "
-                    f"ssm_first6={[round(v, 3) for v in _s0]} "
-                    f"conv_norm={_csel.norm().item() if _csel is not None else float('nan'):.4f}",
-                    flush=True,
-                )
 
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
