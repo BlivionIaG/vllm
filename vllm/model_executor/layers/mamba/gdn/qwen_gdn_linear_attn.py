@@ -1868,9 +1868,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         if os.environ.get("VLLM_DBG_GDN_PTRS") == "1":
             if not getattr(self, "_dbg_ptr_done", False):
                 self._dbg_ptr_done = True
+                _idxv = non_spec_state_indices_tensor[:num_actual_tokens]
                 print(
                     f"[DBG-GDNPTR] {self.prefix} ssm_ptr={ssm_state.data_ptr()} "
                     f"conv_ptr={conv_state.data_ptr()} "
+                    f"slot_idx={_idxv.flatten()[:4].tolist()} "
                     f"ssm_shape={tuple(ssm_state.shape)}",
                     flush=True,
                 )
