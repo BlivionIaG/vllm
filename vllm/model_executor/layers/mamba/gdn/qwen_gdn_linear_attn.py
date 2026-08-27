@@ -1863,6 +1863,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
 
+        if os.environ.get("VLLM_DBG_GDN_PTRS") == "1":
+            if not getattr(self, "_dbg_ptr_done", False):
+                self._dbg_ptr_done = True
+                print(
+                    f"[DBG-GDNPTR] {self.prefix} ssm_ptr={ssm_state.data_ptr()} "
+                    f"conv_ptr={conv_state.data_ptr()} "
+                    f"ssm_shape={tuple(ssm_state.shape)}",
+                    flush=True,
+                )
+
         if os.environ.get("VLLM_DBG_GDN_STATE") == "1" and (
                 "layers.0." in self.prefix or "layers.1." in self.prefix):
             _n = getattr(self, "_dbg_state_n", 0)
