@@ -1529,12 +1529,12 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
   const int kv_end = min(kv_start + kv_per_split, seq_len);
   if (kv_start >= kv_end) {
     // Empty split: write zero partials.
-    const int partial_base_empty = ((q_start_global * H_q + h_q) * BR_PREFILL * kv_splits) + split_idx;
+    const int partial_base_empty = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
     for (int br = 0; br < BR_PREFILL; ++br) {
-      M_partial[partial_base_empty + br * kv_splits] = -INFINITY;
-      L_partial[partial_base_empty + br * kv_splits] = 0.0f;
+      M_partial[partial_base_empty + br * (H_q * kv_splits)] = -INFINITY;
+      L_partial[partial_base_empty + br * (H_q * kv_splits)] = 0.0f;
       for (int d = t; d < 128; d += 128) {
-        O_partial[(partial_base_empty + br * kv_splits) * 128 + d] = 0.0f;
+        O_partial[(partial_base_empty + br * (H_q * kv_splits)) * 128 + d] = 0.0f;
       }
     }
     return;
@@ -1692,10 +1692,10 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
   // Layout: [N, H_q, BR_PREFILL, kv_splits, D] so each br row has its own slot.
   // Each thread t (t < BR_PREFILL) writes its own br row, and all threads
   // cooperate to write the D-dim row using a strided loop.
-  const int partial_base = ((q_start_global * H_q + h_q) * BR_PREFILL * kv_splits) + split_idx;
+  const int partial_base = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
   if (t < BR_PREFILL) {
     const int br = t;
-    const int64_t slot = partial_base + br * kv_splits;
+    const int64_t slot = partial_base + br * (H_q * kv_splits);
     const bool active = (br < br_size);
     if (active) {
       M_partial[slot] = sM[br];
@@ -1706,7 +1706,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
     }
   }
   for (int br = 0; br < BR_PREFILL; ++br) {
-    const int64_t slot = partial_base + br * kv_splits;
+    const int64_t slot = partial_base + br * (H_q * kv_splits);
     const bool active = (br < br_size);
     for (int d = t; d < 128; d += THREADS_PREFILL) {
       O_partial[slot * 128 + d] = active ? sO[br * 128 + d] : 0.0f;
@@ -1746,7 +1746,7 @@ __global__ void fa_prefill_paged_varlen_splitk_reduce_kernel_128(
     // Partial slot base: uses q_start_global (shared across all br in this q_block)
     // + br offset within the BR_PREFILL dimension. NOT token.
     const int64_t slot_base =
-        ((int64_t)(q_start_global * H_q + h_q) * BR_PREFILL + br) * (int64_t)kv_splits;
+        ((int64_t)((q_start_global + br) * H_q + h_q)) * (int64_t)kv_splits;
 
     float m_global = -INFINITY;
     for (int s = 0; s < kv_splits; ++s) {
@@ -1816,12 +1816,12 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
   const int kv_start = split_idx * kv_per_split;
   const int kv_end = min(kv_start + kv_per_split, seq_len);
   if (kv_start >= kv_end) {
-    const int partial_base_empty = ((q_start_global * H_q + h_q) * BR_PREFILL * kv_splits) + split_idx;
+    const int partial_base_empty = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
     for (int br = 0; br < BR_PREFILL; ++br) {
-      M_partial[partial_base_empty + br * kv_splits] = -INFINITY;
-      L_partial[partial_base_empty + br * kv_splits] = 0.0f;
+      M_partial[partial_base_empty + br * (H_q * kv_splits)] = -INFINITY;
+      L_partial[partial_base_empty + br * (H_q * kv_splits)] = 0.0f;
       for (int d = t; d < 256; d += 256) {
-        O_partial[(partial_base_empty + br * kv_splits) * 256 + d] = 0.0f;
+        O_partial[(partial_base_empty + br * (H_q * kv_splits)) * 256 + d] = 0.0f;
       }
     }
     return;
@@ -1972,10 +1972,10 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
     __syncthreads();
   }
 
-  const int partial_base = ((q_start_global * H_q + h_q) * BR_PREFILL * kv_splits) + split_idx;
+  const int partial_base = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
   if (t < BR_PREFILL) {
     const int br = t;
-    const int64_t slot = partial_base + br * kv_splits;
+    const int64_t slot = partial_base + br * (H_q * kv_splits);
     const bool active = (br < br_size);
     if (active) {
       M_partial[slot] = sM[br];
@@ -1986,7 +1986,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
     }
   }
   for (int br = 0; br < BR_PREFILL; ++br) {
-    const int64_t slot = partial_base + br * kv_splits;
+    const int64_t slot = partial_base + br * (H_q * kv_splits);
     const bool active = (br < br_size);
     for (int d = t; d < 256; d += 256) {
       O_partial[slot * 256 + d] = active ? sO[br * 256 + d] : 0.0f;
@@ -2023,7 +2023,7 @@ __global__ void fa_prefill_paged_varlen_splitk_reduce_kernel_256(
     // Partial slot base: uses q_start_global (shared across all br in this q_block)
     // + br offset within the BR_PREFILL dimension. NOT token.
     const int64_t slot_base =
-        ((int64_t)(q_start_global * H_q + h_q) * BR_PREFILL + br) * (int64_t)kv_splits;
+        ((int64_t)((q_start_global + br) * H_q + h_q)) * (int64_t)kv_splits;
 
     float m_global = -INFINITY;
     for (int s = 0; s < kv_splits; ++s) {
@@ -2130,12 +2130,12 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
   const int kv_end = min(kv_start + kv_per_split, seq_len);
   if (kv_start >= kv_end) {
     // Empty split: write zero partials.
-    const int partial_base_empty = ((q_start_global * H_q + h_q) * BR_PREFILL_LOC * kv_splits) + split_idx;
+    const int partial_base_empty = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
     for (int br = 0; br < BR_PREFILL_LOC; ++br) {
-      M_partial[partial_base_empty + br * kv_splits] = -INFINITY;
-      L_partial[partial_base_empty + br * kv_splits] = 0.0f;
+      M_partial[partial_base_empty + br * (H_q * kv_splits)] = -INFINITY;
+      L_partial[partial_base_empty + br * (H_q * kv_splits)] = 0.0f;
       for (int d = t; d < HEAD_DIM; d += THREADS_PREFILL_LOC) {
-        O_partial[(partial_base_empty + br * kv_splits) * HEAD_DIM + d] = 0.0f;
+        O_partial[(partial_base_empty + br * (H_q * kv_splits)) * HEAD_DIM + d] = 0.0f;
       }
     }
     return;
@@ -2313,10 +2313,10 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
   }
 
   // Write partial O (unnormalized), M, L (same layout as fp16 splitk).
-  const int partial_base = ((q_start_global * H_q + h_q) * BR_PREFILL_LOC * kv_splits) + split_idx;
+  const int partial_base = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
   if (t < BR_PREFILL_LOC) {
     const int br = t;
-    const int64_t slot = partial_base + br * kv_splits;
+    const int64_t slot = partial_base + br * (H_q * kv_splits);
     const bool active = (br < br_size);
     if (active) {
       M_partial[slot] = sM[br];
@@ -2327,7 +2327,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
     }
   }
   for (int br = 0; br < BR_PREFILL_LOC; ++br) {
-    const int64_t slot = partial_base + br * kv_splits;
+    const int64_t slot = partial_base + br * (H_q * kv_splits);
     const bool active = (br < br_size);
     for (int d = t; d < HEAD_DIM; d += THREADS_PREFILL_LOC) {
       O_partial[slot * HEAD_DIM + d] = active ? sO[br * HEAD_DIM + d] : 0.0f;
@@ -2391,12 +2391,12 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
   const int kv_start = split_idx * kv_per_split;
   const int kv_end = min(kv_start + kv_per_split, seq_len);
   if (kv_start >= kv_end) {
-    const int partial_base_empty = ((q_start_global * H_q + h_q) * BR_PREFILL_LOC * kv_splits) + split_idx;
+    const int partial_base_empty = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
     for (int br = 0; br < BR_PREFILL_LOC; ++br) {
-      M_partial[partial_base_empty + br * kv_splits] = -INFINITY;
-      L_partial[partial_base_empty + br * kv_splits] = 0.0f;
+      M_partial[partial_base_empty + br * (H_q * kv_splits)] = -INFINITY;
+      L_partial[partial_base_empty + br * (H_q * kv_splits)] = 0.0f;
       for (int d = t; d < HEAD_DIM; d += THREADS_PREFILL_LOC) {
-        O_partial[(partial_base_empty + br * kv_splits) * HEAD_DIM + d] = 0.0f;
+        O_partial[(partial_base_empty + br * (H_q * kv_splits)) * HEAD_DIM + d] = 0.0f;
       }
     }
     return;
@@ -2561,10 +2561,10 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
     __syncthreads();
   }
 
-  const int partial_base = ((q_start_global * H_q + h_q) * BR_PREFILL_LOC * kv_splits) + split_idx;
+  const int partial_base = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
   if (t < BR_PREFILL_LOC) {
     const int br = t;
-    const int64_t slot = partial_base + br * kv_splits;
+    const int64_t slot = partial_base + br * (H_q * kv_splits);
     const bool active = (br < br_size);
     if (active) {
       M_partial[slot] = sM[br];
@@ -2575,7 +2575,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
     }
   }
   for (int br = 0; br < BR_PREFILL_LOC; ++br) {
-    const int64_t slot = partial_base + br * kv_splits;
+    const int64_t slot = partial_base + br * (H_q * kv_splits);
     const bool active = (br < br_size);
     for (int d = t; d < HEAD_DIM; d += THREADS_PREFILL_LOC) {
       O_partial[slot * HEAD_DIM + d] = active ? sO[br * HEAD_DIM + d] : 0.0f;
