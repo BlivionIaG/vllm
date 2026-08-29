@@ -890,7 +890,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_kernel_128(
       if (br < br_size && k < blk_size) {
         // Causal mask uses sequence-local query position.
         // Sliding window: k_global must be >= q_local - sliding_window.
-        const int q_local = q_start_in_seq + br;
+        const int q_local = (seq_len - seq_query_len) + q_start_in_seq + br;
         const int k_global = n + k;
         const bool masked_causal = causal && (k_global > q_local);
         const bool masked_window = (sliding_window > 0)
@@ -1144,7 +1144,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_128_sho
       const int k = idx % BC;
       float acc = 0.0f;
       if (br < br_size && k < blk_size) {
-        const int q_local = q_start_in_seq + br;
+        const int q_local = (seq_len - seq_query_len) + q_start_in_seq + br;
         const int k_global = n + k;
         const bool masked_causal = causal && (k_global > q_local);
         const bool masked_window = (sliding_window > 0)
@@ -1400,7 +1400,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_256(
       const int k = idx % BC_256;
       float acc = 0.0f;
       if (br < br_size && k < blk_size) {
-        const int q_local = q_start_in_seq + br;
+        const int q_local = (seq_len - seq_query_len) + q_start_in_seq + br;
         const int k_global = n + k;
         const bool masked_causal = causal && (k_global > q_local);
         const bool masked_window = (sliding_window > 0)
@@ -1646,7 +1646,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
       const int k = idx % BC;
       float acc = 0.0f;
       if (br < br_size && k < blk_size) {
-        const int q_local = q_start_in_seq + br;
+        const int q_local = (seq_len - seq_query_len) + q_start_in_seq + br;
         const int k_global = n + k;
         const bool masked_causal = causal && (k_global > q_local);
         const bool masked_window = (sliding_window > 0)
@@ -1935,7 +1935,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
       const int k = idx % BC_256;
       float acc = 0.0f;
       if (br < br_size && k < blk_size) {
-        const int q_local = q_start_in_seq + br;
+        const int q_local = (seq_len - seq_query_len) + q_start_in_seq + br;
         const int k_global = n + k;
         const bool masked_causal = causal && (k_global > q_local);
         const bool masked_window = (sliding_window > 0)
@@ -2275,7 +2275,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
       const int k = idx % BC_LOC;
       float acc = 0.0f;
       if (br < br_size && k < blk_size) {
-        const int q_local = q_start_in_seq + br;
+        const int q_local = (seq_len - seq_query_len) + q_start_in_seq + br;
         const int n_global = n + k;
         const bool masked_causal = causal && (n_global > q_local);
         const bool masked_window = (sliding_window > 0)
@@ -2527,7 +2527,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
       const int k = idx % BC_LOC;
       float acc = 0.0f;
       if (br < br_size && k < blk_size) {
-        const int q_local = q_start_in_seq + br;
+        const int q_local = (seq_len - seq_query_len) + q_start_in_seq + br;
         const int n_global = n + k;
         const bool masked_causal = causal && (n_global > q_local);
         const bool masked_window = (sliding_window > 0)
