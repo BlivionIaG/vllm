@@ -59,6 +59,12 @@ from typing import ClassVar, Optional
 import torch
 
 from vllm.v1.attention.ops.paged_attn import PagedAttention
+from vllm.v1.attention.ops.chunked_prefill_paged_decode import (
+    has_native_kv_cache_layout,
+)
+from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+    triton_reshape_and_cache_flash,
+)
 # (env-name string literal; vllm.envs exposes VLLM_USE_RDNA2_FA as a typed default, not a str)
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import (
@@ -126,6 +132,30 @@ def _get_fa_rdna2_module():
     return _fa_rdna2_module
 
 
+def _reinterpret_v_to_5d(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    head_size: int,
+) -> torch.Tensor:
+    """Reinterpret 4D V ([nb, h, D, bs]) as 5D [nb, h, D/x, bs, x].
+
+    reshape_and_cache writes K packed (x-innermost per (d/x, slot)) but V
+    unpacked (slot-innermost per d). The 5D V view must therefore carry the
+    UNPACKED strides (…, x*bs, 1, bs), not the packed (…, x*bs, x, 1) a
+    plain .view() would produce. Split D into (D/x, x) while slot is still
+    innermost, then permute slot back to dim 3.
+    """
+    if (value_cache.dim() == 4 and key_cache.dim() == 5
+            and head_size in _SUPPORTED_HEAD_SIZES):
+        num_blocks, h_kv, head_size_d, block_sz = value_cache.shape
+        x_dim = key_cache.shape[4]
+        if head_size_d % x_dim == 0:
+            value_cache = value_cache.view(
+                num_blocks, h_kv, head_size_d // x_dim, x_dim, block_sz
+            ).permute(0, 1, 2, 4, 3)
+    return value_cache
+
+
 # ---------------------------------------------------------------------------
 # Metadata — minimum fields the FA-RDNA2 dispatcher consumes; built from
 # CommonAttentionMetadata per V1 step.
@@ -155,6 +185,7 @@ class RdnaAttentionMetadata(AttentionMetadata):
         inst.max_query_len = common.max_query_len
         inst.max_seq_len = common.max_seq_len
         inst.slot_mapping = common.slot_mapping
+        inst.causal = common.causal
         return inst
 
 
@@ -292,26 +323,7 @@ class RdnaAttentionImpl(AttentionImpl):
         key_cache: torch.Tensor,
         value_cache: torch.Tensor,
     ) -> torch.Tensor:
-        """Mirror rocm_attn.py:457-462: when V is 4D contiguous and K
-        is already 5D blocks-first paged, reinterpret V's last two
-        dims into the (D/x, block_size, x) layout K uses.
-        """
-        if (
-            value_cache.dim() == 4
-            and key_cache.dim() == 5
-            and self.head_size in _SUPPORTED_HEAD_SIZES
-        ):
-            num_blocks, h_kv, head_size_d, block_sz = value_cache.shape
-            x_dim = key_cache.shape[4]
-            if head_size_d % x_dim == 0:
-                value_cache = value_cache.view(
-                    num_blocks,
-                    h_kv,
-                    head_size_d // x_dim,
-                    block_sz,
-                    x_dim,
-                )
-        return value_cache
+        return _reinterpret_v_to_5d(key_cache, value_cache, self.head_size)
 
     def _is_spec_verify_pass(
         self,
@@ -389,6 +401,44 @@ class RdnaAttentionImpl(AttentionImpl):
                 "RDNA_ATTN: shape out of FA-RNA2 coverage matrix; "
                 "V1 selector should fall back to ROCM_ATTN."
             )
+
+        if os.environ.get("VLLM_DBG_RDNA_SHAPES") == "1" and not getattr(
+                self, "_dbg_shapes_done", False):
+            self._dbg_shapes_done = True
+            logger.info(
+                "[RDNASHAPES] fa_rdna2 active: head_size=%d H_kv=%d "
+                "K=%s strides=%s V=%s strides=%s",
+                self.head_size, self.num_kv_heads, tuple(key_cache.shape),
+                key_cache.stride(), tuple(value_cache.shape),
+                value_cache.stride())
+            logger.info(
+                "[RDNASHAPES] Q=%s strides=%s contig=%s causal=%s "
+                "max_q=%d n_tok=%d seq_lens=%s",
+                tuple(query.shape), query.stride(), query.is_contiguous(),
+                getattr(attn_metadata, "causal", None),
+                attn_metadata.max_query_len, attn_metadata.num_actual_tokens,
+                attn_metadata.seq_lens.tolist())
+
+        if os.environ.get("VLLM_DBG_RDNA_DUMP") == "1" and not getattr(
+                self, "_dbg_dump_done", False):
+            self._dbg_dump_done = True
+            torch.save(
+                {
+                    "query": query[:attn_metadata.num_actual_tokens].cpu(),
+                    "key": key[:attn_metadata.num_actual_tokens].cpu(),
+                    "value": value[:attn_metadata.num_actual_tokens].cpu(),
+                    "kv_cache": kv_cache.cpu(),
+                    "block_table": attn_metadata.block_table.cpu(),
+                    "cu_query_lens": attn_metadata.query_start_loc.cpu(),
+                    "seq_lens": attn_metadata.seq_lens.cpu(),
+                    "scale": self.scale,
+                    "sliding_window": self.sliding_window,
+                    "head_size": self.head_size,
+                    "num_heads": self.num_heads,
+                    "num_kv_heads": self.num_kv_heads,
+                    "kv_cache_dtype": self.kv_cache_dtype,
+                }, "/tmp/rdna_attn_dump.pt")
+            logger.info("[RDNADUMP] wrote /tmp/rdna_attn_dump.pt")
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         max_seqlen_q = attn_metadata.max_query_len
@@ -491,7 +541,16 @@ class RdnaAttentionImpl(AttentionImpl):
         _num_seqs = seqused_k.size(0)
         _SPLITK_MIN_KV_SPLITS = 2
         _kv_splits = min(8, (max_seqlen_k + 1023) // 1024)
-        causal = bool(getattr(attn_metadata, "causal", False))
+        _causal_attr = getattr(attn_metadata, "causal", True)
+        if isinstance(_causal_attr, torch.Tensor):
+            # fa_rdna2 kernels take one batch-wide causal flag.
+            if not bool(_causal_attr.all()):
+                raise NotImplementedError(
+                    "RDNA_ATTN: per-request non-causal mask not supported; "
+                    "V1 selector should fall back to ROCM_ATTN."
+                )
+            _causal_attr = True
+        causal = bool(_causal_attr)
 
         from vllm.v1.kv_cache_interface import get_kv_quant_mode, KVQuantMode
         _qm_p = get_kv_quant_mode(self.kv_cache_dtype)
@@ -640,12 +699,23 @@ class RdnaAttentionImpl(AttentionImpl):
         key_cache, value_cache = PagedAttention.split_kv_cache(
             kv_cache, self.num_kv_heads, self.head_size
         )
-        PagedAttention.write_to_paged_cache(
-            key, value, key_cache, value_cache,
-            slot_mapping, self.kv_cache_dtype,
-            getattr(layer, "_k_scale", None),
-            getattr(layer, "_v_scale", None),
-        )
+        # Mirror rocm_attn.py:489-517: the native writer assumes densely
+        # packed blocks and corrupts stride-padded hybrid layouts.
+        if value_cache.shape[3] in (16, 32) and has_native_kv_cache_layout(
+                key_cache, value_cache):
+            PagedAttention.write_to_paged_cache(
+                key, value, key_cache, value_cache,
+                slot_mapping, self.kv_cache_dtype,
+                getattr(layer, "_k_scale", None),
+                getattr(layer, "_v_scale", None),
+            )
+        else:
+            triton_reshape_and_cache_flash(
+                key, value, key_cache, value_cache,
+                slot_mapping, self.kv_cache_dtype,
+                layer._k_scale,
+                layer._v_scale,
+            )
 
 # ---------------------------------------------------------------------------
 # V1 Backend class registration surface.
