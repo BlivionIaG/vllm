@@ -1,13 +1,64 @@
-# Handoff: Qwen3.8-27B-AWQ fa_rdna2 Debugging
+# Handoff: Qwen3.8-27B-AWQ fa_rdna2 Debugging — RESOLVED
 
-**Date**: 2026-08-29  
-**Author**: Sisyphus  
-**Branch**: `rdna2_extras` (local: `vllm_humanwork_next`, remote: `/home/chenco_adm/vllm_humanwork`)  
+**Date**: 2026-08-29 (resolved same day, second session)
+**Author**: Sisyphus
+**Branch**: `rdna2_extras` (local: `vllm_humanwork_next`, remote: `/home/chenco_adm/vllm_humanwork`)
 **Goal**: Fully working Qwen3.8-27B-AWQ + fa_rdna2 hip + prefix caching + chunked prefill
 
 ---
 
-## 1. Current State — What's Working vs What's Broken
+## 0. Resolution Summary (2026-08-29)
+
+T3 (fa_rdna2) now produces **coherent output end-to-end** on
+Qwen3.8-27B-AWQ-INT4: short prompts ("Paris"), 1k and 5k needle probes
+("ZEPHYR"/"QUASAR"), deterministic (temp=0 identical), dispatch proven via
+`[RDNASHAPES]` log. T2 (fa_rdna2 off) regression: unaffected.
+
+The deterministic garbage was **four stacked bugs**, not one:
+
+| # | Bug | Where | Fix commit |
+|---|-----|-------|-----------|
+| A | Kernels read V with K's **packed** strides, but `reshape_and_cache` writes V **unpacked** (slot-innermost) → every V read permuted | `fa_rdna2.cu` (9 kernels used `stride_kc*` for V) | `e538b4f9b7` |
+| B | Splitk kernels wrote partials for padding rows (`br ≥ br_size`) and reduce kernels processed padding tokens → OOB when `N % BR_PREFILL != 0` (the 5000-token crash; 5000%16=8) | `fa_rdna2.cu` splitk×4 + reduce×2 | `e538b4f9b7` |
+| C | `RdnaAttentionMetadata.from_common` dropped `causal` → `getattr(..., False)` → **all prefills ran non-causal** | `rdna_attn.py` | `322c2acffd` |
+| D | `do_kv_cache_update` always used the **dense** native writer; hybrid caches are stride-padded/interleaved `[nb, 2, ...]` (K block-stride 1605632 ≠ dense 802816) → K/V landed at wrong physical blocks | `rdna_attn.py` (missing `has_native_kv_cache_layout` branch) | `322c2acffd` |
+
+**Why the existing tests missed it**: `test_fa_rdna2_shape_sweep.py` fills V
+directly in packed layout (never goes through the production writer) and uses
+a contiguous `[2, nb, ...]` cache where dense == view strides. The new
+`tests/kernels/attention/test_fa_rdna2_writer_layout.py` goes through the
+real writer and covers both layouts — 19/19 pass on .176.
+
+**V-stride detail**: the correct 5D V view of the unpacked `[nb,h,D,bs]`
+buffer is `view(nb, h, D/x, x, bs).permute(0, 1, 2, 4, 3)` → strides
+`(…, x*bs, 1, bs)`. Kernel gets separate `stride_vc0..4` from
+`value_cache.stride()`. K strides unchanged (packed).
+
+**Key debug artifact**: `/tmp/rdna_attn_dump.pt` on .176 (first prefill
+call's full tensors) — `VLLM_DBG_RDNA_DUMP=1` reproduces it.
+
+### Debug env vars (committed, env-gated)
+- `VLLM_DBG_RDNA_SHAPES=1` — one-time per-layer log of K/V/Q shapes, strides, causal, seq_lens
+- `VLLM_DBG_RDNA_DUMP=1` — one-time per-layer tensor dump to `/tmp/rdna_attn_dump.pt` (107MB per layer, D2H stall — debug only)
+
+### Remaining known issues (not blocking T3)
+1. **Chunked prefill / prefix-cache q_local offset**: kernels compute
+   `q_local = q_start_in_seq + br` (position within the query chunk). For a
+   chunk that starts mid-sequence (chunked prefill or prefix-cache hit), the
+   causal mask needs the KV-offset added. Untested — full-prefill single
+   chunk works.
+2. **int8 KV cache + hybrid layout**: `do_kv_cache_update`'s int8 branch
+   (`reshape_and_cache_int8_rdna2`) has no stride-aware variant. fp16 path
+   unaffected.
+3. **fa_rdna2 performance re-bench**: the kernels were never benchmarked in a
+   working state. Re-run the W4A16×FA matrix from
+   `.omo/plans/rdna2-full-matrix-bench-2026-07-19.md`.
+4. `pkill -f "entrypoints.cli.main"` self-matches the ssh command line —
+   use `pkill -f "entrypoints[.]cli"`.
+
+---
+
+## 1. Current State — What's Working vs What's Broken (SUPERSEDED)
 
 | Config | Status | Evidence |
 |--------|--------|----------|
