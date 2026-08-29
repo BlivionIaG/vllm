@@ -194,12 +194,17 @@ __device__ __forceinline__ half fa_kv_load(const KV_T* ptr, float scale) {
 //   blockIdx.y = h_q
 //   blockIdx.z = split
 //
-// Strides for the 5D paged cache:
-//   stride_kc0 = bytes/element * stride(0) = one block
-//   stride_kc1 = one head within a block
-//   stride_kc2 = one D/x sub-dim
-//   stride_kc3 = one slot within a block
-//   stride_kc4 = one x-element (usually 1)
+// Strides for the 5D paged cache (element units):
+//   stride_kc0/vc0 = one block
+//   stride_kc1/vc1 = one head within a block
+//   stride_kc2/vc2 = one D/x sub-dim
+//   stride_kc3/vc3 = one slot within a block
+//   stride_kc4/vc4 = one x-element
+// K and V have SEPARATE stride sets because reshape_and_cache writes K
+// packed ([.., D/x, bs, x], x-innermost) but V unpacked ([.., D, bs],
+// slot-innermost). The Python side re-views V via
+// view(nb, h, D/x, x, bs).permute(0, 1, 2, 4, 3) so its strides describe
+// the real physical layout (vc3 = 1, vc4 = bs).
 //   x_dim = packing factor (typically 8 for fp16)
 //
 // HEAD_DIM = 128 specialization (the original kernel). A HEAD_DIM = 256
@@ -233,6 +238,11 @@ __global__ __launch_bounds__(128)
     const int stride_kc2,
     const int stride_kc3,
     const int stride_kc4,
+    const int stride_vc0,
+    const int stride_vc1,
+    const int stride_vc2,
+    const int stride_vc3,
+    const int stride_vc4,
     const int max_blocks,
     const int block_size,
     const int x_dim,
@@ -315,11 +325,11 @@ __global__ __launch_bounds__(128)
             + slot * stride_kc3
             + x_idx * stride_kc4;
         const KV_T* v_ptr = value_cache
-            + block_idx * stride_kc0
-            + h_kv * stride_kc1
-            + d_sub * stride_kc2
-            + slot * stride_kc3
-            + x_idx * stride_kc4;
+            + block_idx * stride_vc0
+            + h_kv * stride_vc1
+            + d_sub * stride_vc2
+            + slot * stride_vc3
+            + x_idx * stride_vc4;
         if constexpr (IS_INT8) {
           // Symmetric int8 with per-(token, head) scale. Read int8 byte,
           // sign-extend to fp32, multiply by per-(n_global, h_kv) scale,
@@ -432,6 +442,11 @@ __global__ __launch_bounds__(256)
     const int stride_kc2,
     const int stride_kc3,
     const int stride_kc4,
+    const int stride_vc0,
+    const int stride_vc1,
+    const int stride_vc2,
+    const int stride_vc3,
+    const int stride_vc4,
     const int max_blocks,
     const int block_size,
     const int x_dim,
@@ -507,11 +522,11 @@ __global__ __launch_bounds__(256)
             + slot * stride_kc3
             + x_idx * stride_kc4;
         const KV_T* v_ptr = value_cache
-            + block_idx * stride_kc0
-            + h_kv * stride_kc1
-            + d_sub * stride_kc2
-            + slot * stride_kc3
-            + x_idx * stride_kc4;
+            + block_idx * stride_vc0
+            + h_kv * stride_vc1
+            + d_sub * stride_vc2
+            + slot * stride_vc3
+            + x_idx * stride_vc4;
         if constexpr (IS_INT8) {
           // Same per-(token, head) int8 dequant as the 128 variant.
           const float k_s = k_scale_per_tok[n_global * H_kv + h_kv];
@@ -749,6 +764,11 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_kernel_128(
     const int stride_kc2,
     const int stride_kc3,
     const int stride_kc4,
+    const int stride_vc0,
+    const int stride_vc1,
+    const int stride_vc2,
+    const int stride_vc3,
+    const int stride_vc4,
     const int max_blocks,
     const int block_size,
     const int x_dim,
@@ -850,11 +870,11 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_kernel_128(
             + slot * stride_kc3
             + x_idx * stride_kc4;
         const KV_T* v_ptr = value_cache
-            + block_idx * stride_kc0
-            + h_kv * stride_kc1
-            + d_sub * stride_kc2
-            + slot * stride_kc3
-            + x_idx * stride_kc4;
+            + block_idx * stride_vc0
+            + h_kv * stride_vc1
+            + d_sub * stride_vc2
+            + slot * stride_vc3
+            + x_idx * stride_vc4;
         const int d_swz = fa_swz_d(d, n_local);
         sK[n_local * 128 + d_swz] = fa_kv_load<KV_T, IS_FP8>(k_ptr, k_scale);
         sV[n_local * 128 + d_swz] = fa_kv_load<KV_T, IS_FP8>(v_ptr, v_scale);
@@ -988,6 +1008,11 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_128_sho
     const int stride_kc2,
     const int stride_kc3,
     const int stride_kc4,
+    const int stride_vc0,
+    const int stride_vc1,
+    const int stride_vc2,
+    const int stride_vc3,
+    const int stride_vc4,
     const int max_blocks,
     const int block_size,
     const int x_dim,
@@ -1097,16 +1122,18 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_128_sho
             + slot * stride_kc3
             + x_idx * stride_kc4;
         const half* v_ptr = value_cache
-            + block_idx * stride_kc0
-            + h_kv * stride_kc1
-            + d_sub * stride_kc2
-            + slot * stride_kc3
-            + x_idx * stride_kc4;
+            + block_idx * stride_vc0
+            + h_kv * stride_vc1
+            + d_sub * stride_vc2
+            + slot * stride_vc3
+            + x_idx * stride_vc4;
         const int d_swz = fa_swz_d(d, n_local);
         *reinterpret_cast<half2*>(sK + n_local * HEAD_DIM + d_swz) =
             *reinterpret_cast<const half2*>(k_ptr);
-        *reinterpret_cast<half2*>(sV + n_local * HEAD_DIM + d_swz) =
-            *reinterpret_cast<const half2*>(v_ptr);
+        // V is stored unpacked (slot-innermost), so consecutive d are NOT
+        // contiguous (stride_vc4 = block_size). Scalar loads.
+        sV[n_local * HEAD_DIM + d_swz] = *v_ptr;
+        sV[n_local * HEAD_DIM + d_swz + 1] = *(v_ptr + stride_vc4);
       }
     }
     __syncthreads();
@@ -1258,6 +1285,11 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_256(
     const int stride_kc2,
     const int stride_kc3,
     const int stride_kc4,
+    const int stride_vc0,
+    const int stride_vc1,
+    const int stride_vc2,
+    const int stride_vc3,
+    const int stride_vc4,
     const int max_blocks,
     const int block_size,
     const int x_dim,
@@ -1352,11 +1384,11 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_256(
             + slot * stride_kc3
             + x_idx * stride_kc4;
         const KV_T* v_ptr = value_cache
-            + block_idx * stride_kc0
-            + h_kv * stride_kc1
-            + d_sub * stride_kc2
-            + slot * stride_kc3
-            + x_idx * stride_kc4;
+            + block_idx * stride_vc0
+            + h_kv * stride_vc1
+            + d_sub * stride_vc2
+            + slot * stride_vc3
+            + x_idx * stride_vc4;
         sK[i] = fa_kv_load<KV_T, IS_FP8>(k_ptr, k_scale);
         sV[i] = fa_kv_load<KV_T, IS_FP8>(v_ptr, v_scale);
       }
@@ -1492,6 +1524,11 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
     const int stride_kc2,
     const int stride_kc3,
     const int stride_kc4,
+    const int stride_vc0,
+    const int stride_vc1,
+    const int stride_vc2,
+    const int stride_vc3,
+    const int stride_vc4,
     const int max_blocks,
     const int block_size,
     const int x_dim,
@@ -1530,7 +1567,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
   if (kv_start >= kv_end) {
     // Empty split: write zero partials.
     const int partial_base_empty = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
-    for (int br = 0; br < BR_PREFILL; ++br) {
+    for (int br = 0; br < br_size; ++br) {
       M_partial[partial_base_empty + br * (H_q * kv_splits)] = -INFINITY;
       L_partial[partial_base_empty + br * (H_q * kv_splits)] = 0.0f;
       for (int d = t; d < 128; d += 128) {
@@ -1593,11 +1630,11 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
             + slot * stride_kc3
             + x_idx * stride_kc4;
         const half* v_ptr = value_cache
-            + block_idx * stride_kc0
-            + h_kv * stride_kc1
-            + d_sub * stride_kc2
-            + slot * stride_kc3
-            + x_idx * stride_kc4;
+            + block_idx * stride_vc0
+            + h_kv * stride_vc1
+            + d_sub * stride_vc2
+            + slot * stride_vc3
+            + x_idx * stride_vc4;
         sK[i] = *k_ptr;
         sV[i] = *v_ptr;
       }
@@ -1693,23 +1730,19 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
   // Each thread t (t < BR_PREFILL) writes its own br row, and all threads
   // cooperate to write the D-dim row using a strided loop.
   const int partial_base = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
-  if (t < BR_PREFILL) {
+  // Only real rows (br < br_size) are written: the partial buffers are
+  // sized [N, H_q, kv_splits, *], so writing padding rows of the last
+  // q_block would index past the allocation when N % BR_PREFILL != 0.
+  if (t < br_size) {
     const int br = t;
     const int64_t slot = partial_base + br * (H_q * kv_splits);
-    const bool active = (br < br_size);
-    if (active) {
-      M_partial[slot] = sM[br];
-      L_partial[slot] = sL[br];
-    } else {
-      M_partial[slot] = -INFINITY;
-      L_partial[slot] = 0.0f;
-    }
+    M_partial[slot] = sM[br];
+    L_partial[slot] = sL[br];
   }
-  for (int br = 0; br < BR_PREFILL; ++br) {
+  for (int br = 0; br < br_size; ++br) {
     const int64_t slot = partial_base + br * (H_q * kv_splits);
-    const bool active = (br < br_size);
     for (int d = t; d < 128; d += THREADS_PREFILL) {
-      O_partial[slot * 128 + d] = active ? sO[br * 128 + d] : 0.0f;
+      O_partial[slot * 128 + d] = sO[br * 128 + d];
     }
   }
 }
@@ -1733,7 +1766,8 @@ __global__ void fa_prefill_paged_varlen_splitk_reduce_kernel_128(
     const int H_q,
     const int kv_splits,
     const int stride_qo_tok,
-    const int stride_qo_h) {
+    const int stride_qo_h,
+    const int num_tokens) {
   const int q_block = blockIdx.x;
   const int h_q = blockIdx.y;
   const int d = threadIdx.x;
@@ -1743,6 +1777,9 @@ __global__ void fa_prefill_paged_varlen_splitk_reduce_kernel_128(
 
   for (int br = 0; br < BR_PREFILL; ++br) {
     const int token = q_start_global + br;
+    // Padding rows of the last q_block have no partials written for them;
+    // skip so we never read/write past the [N, ...] buffers.
+    if (token >= num_tokens) break;
     // Partial slot base: uses q_start_global (shared across all br in this q_block)
     // + br offset within the BR_PREFILL dimension. NOT token.
     const int64_t slot_base =
@@ -1781,6 +1818,11 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
     const int stride_kc2,
     const int stride_kc3,
     const int stride_kc4,
+    const int stride_vc0,
+    const int stride_vc1,
+    const int stride_vc2,
+    const int stride_vc3,
+    const int stride_vc4,
     const int max_blocks,
     const int block_size,
     const int x_dim,
@@ -1817,7 +1859,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
   const int kv_end = min(kv_start + kv_per_split, seq_len);
   if (kv_start >= kv_end) {
     const int partial_base_empty = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
-    for (int br = 0; br < BR_PREFILL; ++br) {
+    for (int br = 0; br < br_size; ++br) {
       M_partial[partial_base_empty + br * (H_q * kv_splits)] = -INFINITY;
       L_partial[partial_base_empty + br * (H_q * kv_splits)] = 0.0f;
       for (int d = t; d < 256; d += 256) {
@@ -1877,11 +1919,11 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
             + slot * stride_kc3
             + x_idx * stride_kc4;
         const half* v_ptr = value_cache
-            + block_idx * stride_kc0
-            + h_kv * stride_kc1
-            + d_sub * stride_kc2
-            + slot * stride_kc3
-            + x_idx * stride_kc4;
+            + block_idx * stride_vc0
+            + h_kv * stride_vc1
+            + d_sub * stride_vc2
+            + slot * stride_vc3
+            + x_idx * stride_vc4;
         sK[i] = *k_ptr;
         sV[i] = *v_ptr;
       }
@@ -1973,23 +2015,19 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
   }
 
   const int partial_base = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
-  if (t < BR_PREFILL) {
+  // Only real rows (br < br_size) are written: the partial buffers are
+  // sized [N, H_q, kv_splits, *], so writing padding rows of the last
+  // q_block would index past the allocation when N % BR_PREFILL != 0.
+  if (t < br_size) {
     const int br = t;
     const int64_t slot = partial_base + br * (H_q * kv_splits);
-    const bool active = (br < br_size);
-    if (active) {
-      M_partial[slot] = sM[br];
-      L_partial[slot] = sL[br];
-    } else {
-      M_partial[slot] = -INFINITY;
-      L_partial[slot] = 0.0f;
-    }
+    M_partial[slot] = sM[br];
+    L_partial[slot] = sL[br];
   }
-  for (int br = 0; br < BR_PREFILL; ++br) {
+  for (int br = 0; br < br_size; ++br) {
     const int64_t slot = partial_base + br * (H_q * kv_splits);
-    const bool active = (br < br_size);
     for (int d = t; d < 256; d += 256) {
-      O_partial[slot * 256 + d] = active ? sO[br * 256 + d] : 0.0f;
+      O_partial[slot * 256 + d] = sO[br * 256 + d];
     }
   }
 }
@@ -2010,7 +2048,8 @@ __global__ void fa_prefill_paged_varlen_splitk_reduce_kernel_256(
     const int H_q,
     const int kv_splits,
     const int stride_qo_tok,
-    const int stride_qo_h) {
+    const int stride_qo_h,
+    const int num_tokens) {
   const int q_block = blockIdx.x;
   const int h_q = blockIdx.y;
   const int d = threadIdx.x;
@@ -2020,6 +2059,9 @@ __global__ void fa_prefill_paged_varlen_splitk_reduce_kernel_256(
 
   for (int br = 0; br < BR_PREFILL; ++br) {
     const int token = q_start_global + br;
+    // Padding rows of the last q_block have no partials written for them;
+    // skip so we never read/write past the [N, ...] buffers.
+    if (token >= num_tokens) break;
     // Partial slot base: uses q_start_global (shared across all br in this q_block)
     // + br offset within the BR_PREFILL dimension. NOT token.
     const int64_t slot_base =
@@ -2085,6 +2127,11 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
     const int stride_kc2,
     const int stride_kc3,
     const int stride_kc4,
+    const int stride_vc0,
+    const int stride_vc1,
+    const int stride_vc2,
+    const int stride_vc3,
+    const int stride_vc4,
     const int max_blocks,
     const int block_size,
     const int x_dim,
@@ -2131,7 +2178,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
   if (kv_start >= kv_end) {
     // Empty split: write zero partials.
     const int partial_base_empty = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
-    for (int br = 0; br < BR_PREFILL_LOC; ++br) {
+    for (int br = 0; br < br_size; ++br) {
       M_partial[partial_base_empty + br * (H_q * kv_splits)] = -INFINITY;
       L_partial[partial_base_empty + br * (H_q * kv_splits)] = 0.0f;
       for (int d = t; d < HEAD_DIM; d += THREADS_PREFILL_LOC) {
@@ -2198,11 +2245,11 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
             + slot * stride_kc3
             + x_idx * stride_kc4;
         const int8_t* v_ptr = value_cache
-            + block_idx * stride_kc0
-            + h_kv * stride_kc1
-            + d_sub * stride_kc2
-            + slot * stride_kc3
-            + x_idx * stride_kc4;
+            + block_idx * stride_vc0
+            + h_kv * stride_vc1
+            + d_sub * stride_vc2
+            + slot * stride_vc3
+            + x_idx * stride_vc4;
         sK[i] = *k_ptr;
         sV[i] = *v_ptr;
       }
@@ -2314,23 +2361,18 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
 
   // Write partial O (unnormalized), M, L (same layout as fp16 splitk).
   const int partial_base = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
-  if (t < BR_PREFILL_LOC) {
+  // Only real rows (br < br_size) are written (padding rows of the last
+  // q_block have no partial-buffer slots allocated for them).
+  if (t < br_size) {
     const int br = t;
     const int64_t slot = partial_base + br * (H_q * kv_splits);
-    const bool active = (br < br_size);
-    if (active) {
-      M_partial[slot] = sM[br];
-      L_partial[slot] = sL[br];
-    } else {
-      M_partial[slot] = -INFINITY;
-      L_partial[slot] = 0.0f;
-    }
+    M_partial[slot] = sM[br];
+    L_partial[slot] = sL[br];
   }
-  for (int br = 0; br < BR_PREFILL_LOC; ++br) {
+  for (int br = 0; br < br_size; ++br) {
     const int64_t slot = partial_base + br * (H_q * kv_splits);
-    const bool active = (br < br_size);
     for (int d = t; d < HEAD_DIM; d += THREADS_PREFILL_LOC) {
-      O_partial[slot * HEAD_DIM + d] = active ? sO[br * HEAD_DIM + d] : 0.0f;
+      O_partial[slot * HEAD_DIM + d] = sO[br * HEAD_DIM + d];
     }
   }
 }
@@ -2348,6 +2390,11 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
     const int stride_kc2,
     const int stride_kc3,
     const int stride_kc4,
+    const int stride_vc0,
+    const int stride_vc1,
+    const int stride_vc2,
+    const int stride_vc3,
+    const int stride_vc4,
     const int max_blocks,
     const int block_size,
     const int x_dim,
@@ -2392,7 +2439,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
   const int kv_end = min(kv_start + kv_per_split, seq_len);
   if (kv_start >= kv_end) {
     const int partial_base_empty = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
-    for (int br = 0; br < BR_PREFILL_LOC; ++br) {
+    for (int br = 0; br < br_size; ++br) {
       M_partial[partial_base_empty + br * (H_q * kv_splits)] = -INFINITY;
       L_partial[partial_base_empty + br * (H_q * kv_splits)] = 0.0f;
       for (int d = t; d < HEAD_DIM; d += THREADS_PREFILL_LOC) {
@@ -2454,11 +2501,11 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
             + slot * stride_kc3
             + x_idx * stride_kc4;
         const int8_t* v_ptr = value_cache
-            + block_idx * stride_kc0
-            + h_kv * stride_kc1
-            + d_sub * stride_kc2
-            + slot * stride_kc3
-            + x_idx * stride_kc4;
+            + block_idx * stride_vc0
+            + h_kv * stride_vc1
+            + d_sub * stride_vc2
+            + slot * stride_vc3
+            + x_idx * stride_vc4;
         sK[i] = *k_ptr;
         sV[i] = *v_ptr;
       }
@@ -2562,23 +2609,18 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
   }
 
   const int partial_base = ((q_start_global * H_q + h_q) * kv_splits) + split_idx;
-  if (t < BR_PREFILL_LOC) {
+  // Only real rows (br < br_size) are written (padding rows of the last
+  // q_block have no partial-buffer slots allocated for them).
+  if (t < br_size) {
     const int br = t;
     const int64_t slot = partial_base + br * (H_q * kv_splits);
-    const bool active = (br < br_size);
-    if (active) {
-      M_partial[slot] = sM[br];
-      L_partial[slot] = sL[br];
-    } else {
-      M_partial[slot] = -INFINITY;
-      L_partial[slot] = 0.0f;
-    }
+    M_partial[slot] = sM[br];
+    L_partial[slot] = sL[br];
   }
-  for (int br = 0; br < BR_PREFILL_LOC; ++br) {
+  for (int br = 0; br < br_size; ++br) {
     const int64_t slot = partial_base + br * (H_q * kv_splits);
-    const bool active = (br < br_size);
     for (int d = t; d < HEAD_DIM; d += THREADS_PREFILL_LOC) {
-      O_partial[slot * HEAD_DIM + d] = active ? sO[br * HEAD_DIM + d] : 0.0f;
+      O_partial[slot * HEAD_DIM + d] = sO[br * HEAD_DIM + d];
     }
   }
 }
@@ -2674,6 +2716,11 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
         (int)key_cache.stride(2),
         (int)key_cache.stride(3),
         (int)key_cache.stride(4),
+        (int)value_cache.stride(0),
+        (int)value_cache.stride(1),
+        (int)value_cache.stride(2),
+        (int)value_cache.stride(3),
+        (int)value_cache.stride(4),
         max_blocks,
         (int)block_size,
         x_dim,
@@ -2707,6 +2754,11 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
         (int)key_cache.stride(2),
         (int)key_cache.stride(3),
         (int)key_cache.stride(4),
+        (int)value_cache.stride(0),
+        (int)value_cache.stride(1),
+        (int)value_cache.stride(2),
+        (int)value_cache.stride(3),
+        (int)value_cache.stride(4),
         max_blocks,
         (int)block_size,
         x_dim,
@@ -2832,6 +2884,11 @@ torch::Tensor fa_rdna2_decode_paged_fp8(
         (int)key_cache.stride(2),
         (int)key_cache.stride(3),
         (int)key_cache.stride(4),
+        (int)value_cache.stride(0),
+        (int)value_cache.stride(1),
+        (int)value_cache.stride(2),
+        (int)value_cache.stride(3),
+        (int)value_cache.stride(4),
         max_blocks,
         (int)block_size,
         x_dim,
@@ -2865,6 +2922,11 @@ torch::Tensor fa_rdna2_decode_paged_fp8(
         (int)key_cache.stride(2),
         (int)key_cache.stride(3),
         (int)key_cache.stride(4),
+        (int)value_cache.stride(0),
+        (int)value_cache.stride(1),
+        (int)value_cache.stride(2),
+        (int)value_cache.stride(3),
+        (int)value_cache.stride(4),
         max_blocks,
         (int)block_size,
         x_dim,
@@ -2997,6 +3059,11 @@ torch::Tensor fa_rdna2_prefill_paged_varlen(
         (int)key_cache.stride(2),
         (int)key_cache.stride(3),
         (int)key_cache.stride(4),
+        (int)value_cache.stride(0),
+        (int)value_cache.stride(1),
+        (int)value_cache.stride(2),
+        (int)value_cache.stride(3),
+        (int)value_cache.stride(4),
         max_blocks,
         (int)block_size,
         x_dim,
@@ -3031,6 +3098,11 @@ torch::Tensor fa_rdna2_prefill_paged_varlen(
         (int)key_cache.stride(2),
         (int)key_cache.stride(3),
         (int)key_cache.stride(4),
+        (int)value_cache.stride(0),
+        (int)value_cache.stride(1),
+        (int)value_cache.stride(2),
+        (int)value_cache.stride(3),
+        (int)value_cache.stride(4),
         max_blocks,
         (int)block_size,
         x_dim,
@@ -3136,6 +3208,11 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_fp8(
         (int)key_cache.stride(2),
         (int)key_cache.stride(3),
         (int)key_cache.stride(4),
+        (int)value_cache.stride(0),
+        (int)value_cache.stride(1),
+        (int)value_cache.stride(2),
+        (int)value_cache.stride(3),
+        (int)value_cache.stride(4),
         max_blocks,
         (int)block_size,
         x_dim,
@@ -3170,6 +3247,11 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_fp8(
         (int)key_cache.stride(2),
         (int)key_cache.stride(3),
         (int)key_cache.stride(4),
+        (int)value_cache.stride(0),
+        (int)value_cache.stride(1),
+        (int)value_cache.stride(2),
+        (int)value_cache.stride(3),
+        (int)value_cache.stride(4),
         max_blocks,
         (int)block_size,
         x_dim,
@@ -3261,6 +3343,11 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_short(
       (int)key_cache.stride(2),
       (int)key_cache.stride(3),
       (int)key_cache.stride(4),
+      (int)value_cache.stride(0),
+      (int)value_cache.stride(1),
+      (int)value_cache.stride(2),
+      (int)value_cache.stride(3),
+      (int)value_cache.stride(4),
       max_blocks,
       (int)block_size,
       x_dim,
@@ -3370,6 +3457,11 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(
         (int)key_cache.stride(2),
         (int)key_cache.stride(3),
         (int)key_cache.stride(4),
+        (int)value_cache.stride(0),
+        (int)value_cache.stride(1),
+        (int)value_cache.stride(2),
+        (int)value_cache.stride(3),
+        (int)value_cache.stride(4),
         max_blocks,
         (int)block_size,
         x_dim,
@@ -3388,7 +3480,7 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(
         (const float*)L_partial.data_ptr(),
         (half*)O.data_ptr(),
         max_q_blocks, H_q, (int)kv_splits,
-        H_q * HEAD_DIM, HEAD_DIM);
+        H_q * HEAD_DIM, HEAD_DIM, num_tokens);
   } else {
     constexpr int HEAD_DIM = 256;
     constexpr int THREADS = 256;
@@ -3416,6 +3508,11 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(
         (int)key_cache.stride(2),
         (int)key_cache.stride(3),
         (int)key_cache.stride(4),
+        (int)value_cache.stride(0),
+        (int)value_cache.stride(1),
+        (int)value_cache.stride(2),
+        (int)value_cache.stride(3),
+        (int)value_cache.stride(4),
         max_blocks,
         (int)block_size,
         x_dim,
@@ -3433,7 +3530,7 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(
         (const float*)L_partial.data_ptr(),
         (half*)O.data_ptr(),
         max_q_blocks, H_q, (int)kv_splits,
-        H_q * HEAD_DIM, HEAD_DIM);
+        H_q * HEAD_DIM, HEAD_DIM, num_tokens);
   }
   hipError_t err = hipGetLastError();
   TORCH_CHECK(err == hipSuccess, "fa_rdna2 paged prefill varlen splitk launch failed: ",
@@ -3558,6 +3655,11 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_int8(
         (int)key_cache.stride(2),
         (int)key_cache.stride(3),
         (int)key_cache.stride(4),
+        (int)value_cache.stride(0),
+        (int)value_cache.stride(1),
+        (int)value_cache.stride(2),
+        (int)value_cache.stride(3),
+        (int)value_cache.stride(4),
         max_blocks,
         (int)block_size,
         x_dim,
@@ -3577,7 +3679,7 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_int8(
         (const float*)L_partial.data_ptr(),
         (half*)O.data_ptr(),
         max_q_blocks, H_q, (int)kv_splits,
-        H_q * HEAD_DIM, HEAD_DIM);
+        H_q * HEAD_DIM, HEAD_DIM, num_tokens);
   } else {
     constexpr int HEAD_DIM = 256;
     constexpr int THREADS = 256;
@@ -3607,6 +3709,11 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_int8(
         (int)key_cache.stride(2),
         (int)key_cache.stride(3),
         (int)key_cache.stride(4),
+        (int)value_cache.stride(0),
+        (int)value_cache.stride(1),
+        (int)value_cache.stride(2),
+        (int)value_cache.stride(3),
+        (int)value_cache.stride(4),
         max_blocks,
         (int)block_size,
         x_dim,
@@ -3626,7 +3733,7 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_int8(
         (const float*)L_partial.data_ptr(),
         (half*)O.data_ptr(),
         max_q_blocks, H_q, (int)kv_splits,
-        H_q * HEAD_DIM, HEAD_DIM);
+        H_q * HEAD_DIM, HEAD_DIM, num_tokens);
   }
   hipError_t err = hipGetLastError();
   TORCH_CHECK(err == hipSuccess, "fa_rdna2 paged prefill varlen int8 launch failed: ",
@@ -3716,6 +3823,8 @@ torch::Tensor fa_rdna2_decode_paged_int8(
         (const int*)seq_lens.data_ptr(),
         (int)key_cache.stride(0), (int)key_cache.stride(1),
         (int)key_cache.stride(2), (int)key_cache.stride(3), (int)key_cache.stride(4),
+        (int)value_cache.stride(0), (int)value_cache.stride(1),
+        (int)value_cache.stride(2), (int)value_cache.stride(3), (int)value_cache.stride(4),
         max_blocks, (int)block_size, x_dim,
         (float*)O_partial.data_ptr(),
         (float*)M_partial.data_ptr(),
@@ -3745,6 +3854,8 @@ torch::Tensor fa_rdna2_decode_paged_int8(
         (const int*)seq_lens.data_ptr(),
         (int)key_cache.stride(0), (int)key_cache.stride(1),
         (int)key_cache.stride(2), (int)key_cache.stride(3), (int)key_cache.stride(4),
+        (int)value_cache.stride(0), (int)value_cache.stride(1),
+        (int)value_cache.stride(2), (int)value_cache.stride(3), (int)value_cache.stride(4),
         max_blocks, (int)block_size, x_dim,
         (float*)O_partial.data_ptr(),
         (float*)M_partial.data_ptr(),
