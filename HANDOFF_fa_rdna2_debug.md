@@ -42,11 +42,12 @@ call's full tensors) — `VLLM_DBG_RDNA_DUMP=1` reproduces it.
 - `VLLM_DBG_RDNA_DUMP=1` — one-time per-layer tensor dump to `/tmp/rdna_attn_dump.pt` (107MB per layer, D2H stall — debug only)
 
 ### Remaining known issues (not blocking T3)
-1. **Chunked prefill / prefix-cache q_local offset**: kernels compute
-   `q_local = q_start_in_seq + br` (position within the query chunk). For a
-   chunk that starts mid-sequence (chunked prefill or prefix-cache hit), the
-   causal mask needs the KV-offset added. Untested — full-prefill single
-   chunk works.
+1. ~~Chunked prefill / prefix-cache q_local offset~~ — FIXED in
+   `2bb0b7d0b5` (causal mask now uses the absolute query position
+   `(seq_len - seq_query_len) + q_local` in all 7 prefill kernels).
+   Validated: kernel-level chunked-offset cases + server probe with
+   `--enable-prefix-caching --max-num-batched-tokens 2048` (5k prompt in
+   3 chunks, prefix hit pass 2, needles found, T2 control matches).
 2. **int8 KV cache + hybrid layout**: `do_kv_cache_update`'s int8 branch
    (`reshape_and_cache_int8_rdna2`) has no stride-aware variant. fp16 path
    unaffected.
@@ -55,6 +56,8 @@ call's full tensors) — `VLLM_DBG_RDNA_DUMP=1` reproduces it.
    `.omo/plans/rdna2-full-matrix-bench-2026-07-19.md`.
 4. `pkill -f "entrypoints.cli.main"` self-matches the ssh command line —
    use `pkill -f "entrypoints[.]cli"`.
+5. Prefix caching on hybrid models runs in Mamba cache 'align' mode
+   (experimental upstream warning) — works in the probe, watch for drift.
 
 ---
 
