@@ -634,23 +634,6 @@ class RdnaAttentionImpl(AttentionImpl):
         return output
 
     # ------------------------------------------------------------------
-    # V1 cudagraph-capture path. RDNA_ATTN doesn't yet support the
-    # capture path (it relies on a per-shape dispatch that cudagraph
-    # capture can't easily wrap). Raise NotImplementedError so V1
-    # worker falls back to ROCM_ATTN during capture.
-    # ------------------------------------------------------------------
-    def forward_cudagraph_capture(
-        self,
-        common_attn_metadata,
-        attn_cudagraph_inputs,
-    ) -> torch.Tensor:
-        raise NotImplementedError(
-            "RDNA_ATTN: cudagraph-capture path not implemented; "
-            "V1 worker falls back to ROCM_ATTN for capture, "
-            "then re-enters RDNA_ATTN for replay if shape matches."
-        )
-
-    # ------------------------------------------------------------------
     # V1 encoder-attention path. RDNA_ATTN is text-only; encoder
     # attention is delegated to ROCM_ATTN (which has the encoder
     # shapes handled by its own Triton fallback).
