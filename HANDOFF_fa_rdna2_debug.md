@@ -57,6 +57,45 @@ call's full tensors) — `VLLM_DBG_RDNA_DUMP=1` reproduces it.
 5. Prefix caching on hybrid models runs in Mamba cache 'align' mode
    (experimental upstream warning) — works in the probe, watch for drift.
 
+### Kernel profile findings (2026-08-29, rocprofv3, TP=1 eager offline run —
+### kernel-duration ranking transfers to TP=4; wall times do not)
+
+Trace: .176:/tmp/rocprof_run/par1-cs25/630783_kernel_trace.csv (1.33M
+dispatches: 16k prefill + 128 decode + 1k prefill + 256 decode).
+Aggregator: /tmp/agg_rocprof.py.
+
+Ranked improvement opportunities for the production stack
+(V2+FPP+fa_rdna2+W4A16+pc+chunked):
+
+- **P0 — fa_rdna2 D=256 prefill attention is memory-inefficient**:
+  ~67-72 µs per KV-token per layer (general varlen AND splitk).
+  fa_prefill_paged_varlen_splitk_kernel_256 alone = 107s of 152.5s kernel
+  time in a 16k prefill (70%). Structural cause: scalar 2-byte global
+  loads with per-element block_table math; K is x-packed (16B vectorizable)
+  and V is slot-contiguous (vectorizable along slots); hoist block_table
+  per BC block. Target 3-5× on prefill attention.
+- **P1 — W4A16 prefill falls back to dequant-per-chunk + dense GEMM**:
+  gptq_gemm (q_gemm.cu:1827) allocates a full-size temp_dq and runs
+  reconstruct_exllama + rocBLAS dense GEMM per linear per chunk
+  (~2550 reconstruct calls + ~31s dense Cijk GEMM per 16k prefill).
+  Real fix: gfx1030 W4A16 prefill kernel (M>=16, V_DOT2). Cheap interim:
+  check why the Triton W4A16 path isn't selected for M>8 on ROCm.
+- **P2 — fa_rdna2 decode attention 20-60× off memory-bound ideal**
+  (1.72ms/call at 1k ctx vs ~4-70µs ideal KV-read): same scalar-load
+  structure. Vectorize K (x-packed) and V (slot-contiguous) loads.
+- **P3 — lm_head runs M=1 as tiled GEMM** (Cijk MT128x256 ~18ms/call at
+  TP=1, once per step): route through a skinny-GEMM/wvSplitK path.
+- **P4 — elementwise storm**: fp16<->fp32 copies (177k calls), fills
+  (120k), pow/mean/rsqrt RMSNorm round-trips (63k each). Few % of GPU time;
+  hidden launch cost under cudagraphs. Lower priority.
+- **Correction to earlier note**: the GDN HIP chain DOES fire in this
+  config (gdn_prefill_{prep,kkt,solve_wy,delta_h,o}_rdna2 +
+  gdn_decode_packed_rdna2 all present, hundreds of calls). The earlier
+  "HIP chain registered but not selected" note is stale.
+
+GDN prefill chain total: ~6.9s per 16k prefill (4.5%) — already HIP,
+not the bottleneck.
+
 ### TP=4 + cudagraph validation (2026-08-29)
 
 Config: 4× V620, TP=4, Qwen3.8-27B-AWQ-INT4, prefix caching on,
