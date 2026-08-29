@@ -1337,21 +1337,32 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_256(
     return;
   }
 
+  // sK/sV rows padded to 264 halfs so the vectorized K store (one 16B
+  // write per lane across consecutive n_local) does not collapse onto a
+  // single smem bank quad.
+  constexpr int DSK = 256 + 8;
   extern __shared__ unsigned char smem_raw[];
   half*  sQ  = reinterpret_cast<half*>(smem_raw);
   half*  sK  = sQ + BR_PREFILL * 256;
-  half*  sV  = sK + BC_256 * 256;
-  float* sP  = reinterpret_cast<float*>(sV + BC_256 * 256);
+  half*  sV  = sK + BC_256 * DSK;
+  float* sP  = reinterpret_cast<float*>(sV + BC_256 * DSK);
   float* sM  = sP + BC_256 * BR_PREFILL;
   float* sL  = sM + BR_PREFILL;
   float* sO  = sL + BR_PREFILL;
+  __shared__ int s_blk[BC_256];
+  __shared__ int s_slot[BC_256];
 
   {
     const half* Q_row = Q + (q_start_global * stride_qo_tok + h_q * stride_qo_h);
-    for (int i = t; i < BR_PREFILL * 256; i += 256) {
-      const int br = i / 256;
-      const int d = i % 256;
-      sQ[i] = (br < br_size) ? Q_row[br * stride_qo_tok + d] : __float2half(0.0f);
+    for (int g = t; g < BR_PREFILL * 32; g += 256) {
+      const int br = g / 32;
+      const int dx = g % 32;
+      uint4 q4 = make_uint4(0, 0, 0, 0);
+      if (br < br_size) {
+        q4 = *reinterpret_cast<const uint4*>(Q_row + br * stride_qo_tok
+                                             + dx * 8);
+      }
+      *reinterpret_cast<uint4*>(&sQ[br * 256 + dx * 8]) = q4;
     }
   }
   __syncthreads();
@@ -1368,29 +1379,91 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_256(
   for (int n = 0; n < seq_len; n += BC_256) {
     const int blk_size = min(BC_256, seq_len - n);
 
-    for (int i = t; i < BC_256 * 256; i += 256) {
-      const int n_local = i / 256;
-      const int d = i % 256;
-      if (n_local < blk_size) {
-        const int n_global = n + n_local;
-        const int block_idx = seq_block_table[n_global / block_size];
-        const int slot = n_global % block_size;
-        const int d_sub = d / x_dim;
-        const int x_idx = d % x_dim;
-        const KV_T* k_ptr = key_cache
-            + block_idx * stride_kc0
-            + h_kv * stride_kc1
-            + d_sub * stride_kc2
-            + slot * stride_kc3
-            + x_idx * stride_kc4;
-        const KV_T* v_ptr = value_cache
-            + block_idx * stride_vc0
-            + h_kv * stride_vc1
-            + d_sub * stride_vc2
-            + slot * stride_vc3
-            + x_idx * stride_vc4;
-        sK[i] = fa_kv_load<KV_T, IS_FP8>(k_ptr, k_scale);
-        sV[i] = fa_kv_load<KV_T, IS_FP8>(v_ptr, v_scale);
+    // Page mapping once per KV block: kills the per-element div/mod and
+    // block_table re-reads.
+    if (t < BC_256) {
+      const int n_global = n + t;
+      const bool ok = (t < blk_size);
+      s_blk[t] = ok ? seq_block_table[n_global / block_size] : 0;
+      s_slot[t] = ok ? (n_global % block_size) : 0;
+    }
+    __syncthreads();
+
+    const bool kv_vec_ok =
+        (sizeof(KV_T) == 2) && (!IS_FP8)
+        && stride_kc4 == 1 && stride_vc3 == 1
+        && x_dim == 8 && ((block_size & 7) == 0);
+    if (kv_vec_ok) {
+      // K is x-packed: 8 consecutive d are contiguous per (slot, d_sub).
+      // n_local-fastest mapping: each warp covers 32 consecutive slots
+      // (512B contiguous global) for one d_sub; padded rows keep the 16B
+      // smem stores at <=4-way bank conflicts.
+      constexpr int NX = 256 / 8;
+      for (int i = t; i < BC_256 * NX; i += 256) {
+        const int n_local = i % BC_256;
+        const int d_sub = i / BC_256;
+        if (n_local < blk_size) {
+          const half* kp = reinterpret_cast<const half*>(key_cache)
+              + s_blk[n_local] * stride_kc0
+              + h_kv * stride_kc1 + d_sub * stride_kc2
+              + s_slot[n_local] * stride_kc3;
+          *reinterpret_cast<uint4*>(&sK[n_local * DSK + d_sub * 8]) =
+              *reinterpret_cast<const uint4*>(kp);
+        }
+      }
+      // V is slot-innermost: 8 consecutive slots contiguous per d.
+      // Slot-group-fastest mapping: 64B contiguous global runs per warp.
+      constexpr int NSG = BC_256 / 8;
+      for (int i = t; i < 256 * NSG; i += 256) {
+        const int sg = i % NSG;
+        const int d = i / NSG;
+        const int n_local = sg * 8;
+        if (n_local < blk_size) {
+          const half* vp = reinterpret_cast<const half*>(value_cache)
+              + s_blk[n_local] * stride_vc0
+              + h_kv * stride_vc1 + (d / 8) * stride_vc2
+              + (d % 8) * stride_vc4 + s_slot[n_local] * stride_vc3;
+          if ((s_slot[n_local] & 7) == 0) {
+            const uint4 v4 = *reinterpret_cast<const uint4*>(vp);
+            const half* vv = reinterpret_cast<const half*>(&v4);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+              sV[(n_local + j) * DSK + d] = vv[j];
+            }
+          } else {
+            // Misaligned groups can straddle a block boundary — per-element
+            // page lookup (aligned groups never straddle: block_size%8==0).
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+              const int nl = n_local + j;
+              if (nl < blk_size) {
+                sV[nl * DSK + d] = *(reinterpret_cast<const half*>(value_cache)
+                    + s_blk[nl] * stride_vc0 + h_kv * stride_vc1
+                    + (d / 8) * stride_vc2 + (d % 8) * stride_vc4
+                    + s_slot[nl] * stride_vc3);
+              }
+            }
+          }
+        }
+      }
+    } else {
+      for (int i = t; i < BC_256 * 256; i += 256) {
+        const int n_local = i / 256;
+        const int d = i % 256;
+        if (n_local < blk_size) {
+          const int d_sub = d / x_dim;
+          const int x_idx = d % x_dim;
+          const KV_T* k_ptr = key_cache
+              + s_blk[n_local] * stride_kc0 + h_kv * stride_kc1
+              + d_sub * stride_kc2 + s_slot[n_local] * stride_kc3
+              + x_idx * stride_kc4;
+          const KV_T* v_ptr = value_cache
+              + s_blk[n_local] * stride_vc0 + h_kv * stride_vc1
+              + d_sub * stride_vc2 + s_slot[n_local] * stride_vc3
+              + x_idx * stride_vc4;
+          sK[n_local * DSK + d] = fa_kv_load<KV_T, IS_FP8>(k_ptr, k_scale);
+          sV[n_local * DSK + d] = fa_kv_load<KV_T, IS_FP8>(v_ptr, v_scale);
+        }
       }
     }
     __syncthreads();
@@ -1408,7 +1481,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_256(
         const bool masked = masked_causal || masked_window;
         if (!masked) {
           const half* sQ_row = sQ + br * 256;
-          const half* sK_row = sK + k * 256;
+          const half* sK_row = sK + k * DSK;
           #pragma unroll
           for (int d = 0; d < 256; d += 2) {
             half2 q2 = *reinterpret_cast<const half2*>(&sQ_row[d]);
@@ -1469,7 +1542,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_kernel_256(
         for (int k = 0; k < BC_256; ++k) {
           if (k < blk_size) {
             float p_val = sP[br * BC_256 + k];
-            float v_val = __half2float(sV[k * 256 + d]);
+            float v_val = __half2float(sV[k * DSK + d]);
             pv = fmaf(p_val, v_val, pv);
           }
         }
@@ -1872,21 +1945,32 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
   const int stride_qo_tok = H_q * 256;
   const int stride_qo_h = 256;
 
+  // sK/sV rows padded to 264 halfs so the vectorized K store (one 16B
+  // write per lane across consecutive n_local) does not collapse onto a
+  // single smem bank quad.
+  constexpr int DSK = 256 + 8;
   extern __shared__ unsigned char smem_raw[];
   half*  sQ  = reinterpret_cast<half*>(smem_raw);
   half*  sK  = sQ + BR_PREFILL * 256;
-  half*  sV  = sK + BC_256 * 256;
-  float* sP  = reinterpret_cast<float*>(sV + BC_256 * 256);
+  half*  sV  = sK + BC_256 * DSK;
+  float* sP  = reinterpret_cast<float*>(sV + BC_256 * DSK);
   float* sM  = sP + BC_256 * BR_PREFILL;
   float* sL  = sM + BR_PREFILL;
   float* sO  = sL + BR_PREFILL;
+  __shared__ int s_blk[BC_256];
+  __shared__ int s_slot[BC_256];
 
   {
     const half* Q_row = Q + (q_start_global * stride_qo_tok + h_q * stride_qo_h);
-    for (int i = t; i < BR_PREFILL * 256; i += 256) {
-      const int br = i / 256;
-      const int d = i % 256;
-      sQ[i] = (br < br_size) ? Q_row[br * stride_qo_tok + d] : __float2half(0.0f);
+    for (int g = t; g < BR_PREFILL * 32; g += 256) {
+      const int br = g / 32;
+      const int dx = g % 32;
+      uint4 q4 = make_uint4(0, 0, 0, 0);
+      if (br < br_size) {
+        q4 = *reinterpret_cast<const uint4*>(Q_row + br * stride_qo_tok
+                                             + dx * 8);
+      }
+      *reinterpret_cast<uint4*>(&sQ[br * 256 + dx * 8]) = q4;
     }
   }
   __syncthreads();
@@ -1903,29 +1987,90 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
   for (int n = kv_start; n < kv_end; n += BC_256) {
     const int blk_size = min(BC_256, kv_end - n);
 
-    for (int i = t; i < BC_256 * 256; i += 256) {
-      const int n_local = i / 256;
-      const int d = i % 256;
-      if (n_local < blk_size) {
-        const int n_global = n + n_local;
-        const int block_idx = seq_block_table[n_global / block_size];
-        const int slot = n_global % block_size;
-        const int d_sub = d / x_dim;
-        const int x_idx = d % x_dim;
-        const half* k_ptr = key_cache
-            + block_idx * stride_kc0
-            + h_kv * stride_kc1
-            + d_sub * stride_kc2
-            + slot * stride_kc3
-            + x_idx * stride_kc4;
-        const half* v_ptr = value_cache
-            + block_idx * stride_vc0
-            + h_kv * stride_vc1
-            + d_sub * stride_vc2
-            + slot * stride_vc3
-            + x_idx * stride_vc4;
-        sK[i] = *k_ptr;
-        sV[i] = *v_ptr;
+    // Page mapping once per KV block: kills the per-element div/mod and
+    // block_table re-reads.
+    if (t < BC_256) {
+      const int n_global = n + t;
+      const bool ok = (t < blk_size);
+      s_blk[t] = ok ? seq_block_table[n_global / block_size] : 0;
+      s_slot[t] = ok ? (n_global % block_size) : 0;
+    }
+    __syncthreads();
+
+    const bool kv_vec_ok =
+        (stride_kc4 == 1) && (stride_vc3 == 1)
+        && x_dim == 8 && ((block_size & 7) == 0);
+    if (kv_vec_ok) {
+      // K is x-packed: 8 consecutive d are contiguous per (slot, d_sub).
+      // n_local-fastest mapping: each warp covers 32 consecutive slots
+      // (512B contiguous global) for one d_sub; padded rows keep the 16B
+      // smem stores at <=4-way bank conflicts.
+      constexpr int NX = 256 / 8;
+      for (int i = t; i < BC_256 * NX; i += 256) {
+        const int n_local = i % BC_256;
+        const int d_sub = i / BC_256;
+        if (n_local < blk_size) {
+          const half* kp = reinterpret_cast<const half*>(key_cache)
+              + s_blk[n_local] * stride_kc0
+              + h_kv * stride_kc1 + d_sub * stride_kc2
+              + s_slot[n_local] * stride_kc3;
+          *reinterpret_cast<uint4*>(&sK[n_local * DSK + d_sub * 8]) =
+              *reinterpret_cast<const uint4*>(kp);
+        }
+      }
+      // V is slot-innermost: 8 consecutive slots contiguous per d.
+      // Slot-group-fastest mapping: 64B contiguous global runs per warp.
+      constexpr int NSG = BC_256 / 8;
+      for (int i = t; i < 256 * NSG; i += 256) {
+        const int sg = i % NSG;
+        const int d = i / NSG;
+        const int n_local = sg * 8;
+        if (n_local < blk_size) {
+          const half* vp = reinterpret_cast<const half*>(value_cache)
+              + s_blk[n_local] * stride_vc0
+              + h_kv * stride_vc1 + (d / 8) * stride_vc2
+              + (d % 8) * stride_vc4 + s_slot[n_local] * stride_vc3;
+          if ((s_slot[n_local] & 7) == 0) {
+            const uint4 v4 = *reinterpret_cast<const uint4*>(vp);
+            const half* vv = reinterpret_cast<const half*>(&v4);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+              sV[(n_local + j) * DSK + d] = vv[j];
+            }
+          } else {
+            // Misaligned groups can straddle a block boundary — per-element
+            // page lookup (aligned groups never straddle: block_size%8==0).
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+              const int nl = n_local + j;
+              if (nl < blk_size) {
+                sV[nl * DSK + d] = *(reinterpret_cast<const half*>(value_cache)
+                    + s_blk[nl] * stride_vc0 + h_kv * stride_vc1
+                    + (d / 8) * stride_vc2 + (d % 8) * stride_vc4
+                    + s_slot[nl] * stride_vc3);
+              }
+            }
+          }
+        }
+      }
+    } else {
+      for (int i = t; i < BC_256 * 256; i += 256) {
+        const int n_local = i / 256;
+        const int d = i % 256;
+        if (n_local < blk_size) {
+          const int d_sub = d / x_dim;
+          const int x_idx = d % x_dim;
+          const half* k_ptr = key_cache
+              + s_blk[n_local] * stride_kc0 + h_kv * stride_kc1
+              + d_sub * stride_kc2 + s_slot[n_local] * stride_kc3
+              + x_idx * stride_kc4;
+          const half* v_ptr = value_cache
+              + s_blk[n_local] * stride_vc0 + h_kv * stride_vc1
+              + d_sub * stride_vc2 + s_slot[n_local] * stride_vc3
+              + x_idx * stride_vc4;
+          sK[n_local * DSK + d] = *k_ptr;
+          sV[n_local * DSK + d] = *v_ptr;
+        }
       }
     }
     __syncthreads();
@@ -1943,7 +2088,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
         const bool masked = masked_causal || masked_window;
         if (!masked) {
           const half* sQ_row = sQ + br * 256;
-          const half* sK_row = sK + k * 256;
+          const half* sK_row = sK + k * DSK;
           #pragma unroll
           for (int d = 0; d < 256; d += 2) {
             half2 q2 = *reinterpret_cast<const half2*>(&sQ_row[d]);
@@ -2004,7 +2149,7 @@ __global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_
         for (int k = 0; k < BC_256; ++k) {
           if (k < blk_size) {
             float p_val = sP[br * BC_256 + k];
-            float v_val = __half2float(sV[k * 256 + d]);
+            float v_val = __half2float(sV[k * DSK + d]);
             pv = fmaf(p_val, v_val, pv);
           }
         }
@@ -3078,7 +3223,7 @@ torch::Tensor fa_rdna2_prefill_paged_varlen(
     dim3 grid(max_q_blocks, H_q, num_seqs);
     dim3 block(THREADS);
     size_t smem = BR_PREFILL * HEAD_DIM * sizeof(half)
-                + BC_LOC * HEAD_DIM * sizeof(half) * 2
+                + BC_LOC * (HEAD_DIM + 8) * sizeof(half) * 2
                 + BC_LOC * BR_PREFILL * sizeof(float)
                 + BR_PREFILL * sizeof(float) * 3
                 + BR_PREFILL * HEAD_DIM * sizeof(float)
@@ -3227,7 +3372,7 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_fp8(
     dim3 grid(max_q_blocks, H_q, num_seqs);
     dim3 block(THREADS);
     size_t smem = BR_PREFILL * HEAD_DIM * sizeof(half)
-                + BC_LOC * HEAD_DIM * sizeof(half) * 2
+                + BC_LOC * (HEAD_DIM + 8) * sizeof(half) * 2
                 + BC_LOC * BR_PREFILL * sizeof(float)
                 + BR_PREFILL * sizeof(float) * 3
                 + BR_PREFILL * HEAD_DIM * sizeof(float)
@@ -3488,7 +3633,7 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(
     dim3 grid(max_q_blocks, H_q, num_seqs * (int)kv_splits);
     dim3 block(THREADS);
     size_t smem = BR_PREFILL * HEAD_DIM * sizeof(half)
-                + BC_LOC * HEAD_DIM * sizeof(half) * 2
+                + BC_LOC * (HEAD_DIM + 8) * sizeof(half) * 2
                 + BC_LOC * BR_PREFILL * sizeof(float)
                 + BR_PREFILL * sizeof(float) * 3
                 + BR_PREFILL * HEAD_DIM * sizeof(float)
