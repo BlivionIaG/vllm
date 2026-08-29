@@ -51,13 +51,40 @@ call's full tensors) — `VLLM_DBG_RDNA_DUMP=1` reproduces it.
 2. **int8 KV cache + hybrid layout**: `do_kv_cache_update`'s int8 branch
    (`reshape_and_cache_int8_rdna2`) has no stride-aware variant. fp16 path
    unaffected.
-3. **fa_rdna2 performance re-bench**: the kernels were never benchmarked in a
-   working state. Re-run the W4A16×FA matrix from
-   `.omo/plans/rdna2-full-matrix-bench-2026-07-19.md`.
+3. ~~fa_rdna2 performance re-bench~~ — done 2026-08-29, see below.
 4. `pkill -f "entrypoints.cli.main"` self-matches the ssh command line —
    use `pkill -f "entrypoints[.]cli"`.
 5. Prefix caching on hybrid models runs in Mamba cache 'align' mode
    (experimental upstream warning) — works in the probe, watch for drift.
+
+### TP=4 + cudagraph validation (2026-08-29)
+
+Config: 4× V620, TP=4, Qwen3.8-27B-AWQ-INT4, prefix caching on,
+`--max-num-batched-tokens 2048`, V2 runner + `FULL_AND_PIECEWISE` +
+`compile_ranges_endpoints=[]`, `VLLM_USE_AOT_COMPILE=0`.
+
+- FULL (7×) + PIECEWISE (9×) captures fire; no downgrade to PIECEWISE-only.
+- Output coherent at short/1k/5k, multi-chunk, prefix-hit passes.
+- Determinism at temp=0: bit-identical with prefix caching OFF; with prefix
+  caching ON, a full cache hit routes the last token through the decode
+  kernel instead of prefill, giving benign fp16-level divergence.
+- venv-7.14.0's bundled rccl is 2.30.4 — same upstream code as the
+  rccl-rdna fork (rocm-systems HEAD), so the `nccl==2.30.4` log line is the
+  BUNDLED lib, not the fork. Fork is unused (reference binary only).
+
+Bench (eager → cudagraph), vllm bench serve, random dataset, chat endpoint:
+
+| Workload | c | TTFT med | TPOT med | Aggregate out tok/s |
+|---|---|---|---|---|
+| 1k/512 | 1 | 4.01 → 4.02 s | 94.5 → 28.8 ms (3.3×) | 9.7 → 26.8 (2.8×) |
+| 1k/512 | 8 | 41.1 → 49.0 s | 175.8 → 108.5 ms | 29.1 → 39.8 |
+| 1k/512 | 16 | 45.4 → 44.9 s | 221.0 → 161.7 ms | 44.0 → 53.4 |
+| 16k/1k | 1 | 53.2 → 52.9 s | 108.8 → 45.6 ms (2.4×) | 6.2 → 10.3 (1.7×) |
+| 16k/1k | 8 | 161.2 → 161.0 s | 502.7 → 446.4 ms | 12.0 → 13.2 |
+| 16k/1k | 16 | 205.8 → 203.7 s | 787.0 → 618.1 ms | 11.8 → 14.4 |
+
+TTFT unchanged (prefill is piecewise either way); the win is decode launch
+overhead, largest at c=1. Raw JSON: .176:/tmp/bench_t3_tp4{,_cg}/*.json.
 
 ---
 
