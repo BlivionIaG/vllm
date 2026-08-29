@@ -239,6 +239,36 @@ def _run(fn, *args):
         return f"FAIL ({e})"
 
 
+# Chunked-prefill / prefix-cache path: the query tensor holds only a
+# mid-sequence chunk (nq < seq_len). The causal mask must use the absolute
+# query position (kv_offset + chunk-local index), not the chunk-local one.
+@pytest.mark.parametrize("kernel", ["general", "splitk", "short"])
+def test_prefill_chunked_offset(kernel):
+    if kernel == "short":
+        H_q, H_kv, D, bs = 16, 4, 128, 16
+        full, nq = 512, 256
+    else:
+        H_q, H_kv, D, bs = 24, 4, 256, 784
+        full, nq = 2000, 1000
+    kc, vc, bt, per_seq_kv = _fill_cache([full], H_kv, D, bs, seed=full)
+    torch.manual_seed(full)
+    Q = torch.randn(nq, H_q, D, dtype=torch.float16, device="cuda")
+    cu = torch.tensor([0, nq], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([full], dtype=torch.int32, device="cuda")
+    if kernel == "splitk":
+        out = fa.fa_rdna2_prefill_paged_varlen_splitk(
+            Q, kc, vc, bt, cu, seq_lens, bs, 1, 0, 4)
+    elif kernel == "short":
+        out = fa.fa_rdna2_prefill_paged_varlen_short(
+            Q, kc, vc, bt, cu, seq_lens, bs, 1, 0)
+    else:
+        out = fa.fa_rdna2_prefill_paged_varlen(
+            Q, kc, vc, bt, cu, seq_lens, bs, 1, 0)
+    ref = _ref_attention(Q, per_seq_kv, [0, nq], H_kv, causal=True)
+    err = _max_rel_err(out, ref)
+    assert err < 5e-3, f"chunked {kernel} D={D}: max_rel_err={err}"
+
+
 def test_metadata_carries_causal():
     """RdnaAttentionMetadata must propagate CommonAttentionMetadata.causal.
 
@@ -287,8 +317,13 @@ if __name__ == "__main__":
     results.append(("prefill  D=256 multiseq",
                     _run(test_prefill_varlen_d256_multiseq)))
     results.append(("metadata causal", _run(test_metadata_carries_causal)))
+    for kernel in ("general", "splitk", "short"):
+        results.append((f"prefill  chunked-offset {kernel}",
+                        _run(test_prefill_chunked_offset, kernel)))
     for name, res in results:
         print(f"{name}: {res}", flush=True)
-    if not report_only and any(r != "PASS" for _, r in results):
-        raise SystemExit(1)
-    print("ALL PASS")
+    if any(r != "PASS" for _, r in results):
+        if not report_only:
+            raise SystemExit(1)
+    else:
+        print("ALL PASS")
