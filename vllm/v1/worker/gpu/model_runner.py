@@ -854,8 +854,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
+        # RDNA investigation: per-method timing (env-gated)
+        _t0 = time.perf_counter() if os.environ.get("VLLM_DBG_STEP_TIMING") == "1" else 0.0
         for req_id in finished_req_ids:
             self._remove_request(req_id)
+        if _t0 > 0:
+            logger.info(
+                "[rdna-step-time] finish_requests n=%d %.3fms",
+                len(finished_req_ids),
+                (time.perf_counter() - _t0) * 1000,
+            )
 
     def free_states(self, scheduler_output: SchedulerOutput) -> None:
         if self.encoder_cache is not None:
@@ -965,6 +973,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def prepare_inputs(
         self, scheduler_output: SchedulerOutput, batch_desc: BatchExecutionDescriptor
     ) -> InputBatch:
+        # RDNA investigation: per-method timing (env-gated)
+        _t0 = time.perf_counter() if os.environ.get("VLLM_DBG_STEP_TIMING") == "1" else 0.0
         num_tokens = scheduler_output.total_num_scheduled_tokens
         num_tokens_after_padding = batch_desc.num_tokens
         assert num_tokens > 0
@@ -1141,6 +1151,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
             prompt_lens=prompt_lens,
         )
+        if _t0 > 0:
+            logger.info(
+                "[rdna-step-time] prepare_inputs n_tok=%d n_reqs=%d %.3fms",
+                num_tokens,
+                len(scheduler_output.num_scheduled_tokens),
+                (time.perf_counter() - _t0) * 1000,
+            )
         return pcp.maybe_partition_pcp_batch(self.pcp_manager, input_batch)
 
     def prepare_attn(

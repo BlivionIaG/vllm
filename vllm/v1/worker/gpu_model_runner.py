@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -4200,12 +4201,17 @@ class GPUModelRunner(
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        # RDNA investigation: per-step timing breakdown (env-gated)
+        _dbg_step = os.environ.get("VLLM_DBG_STEP_TIMING") == "1"
+        _t0 = time.perf_counter() if _dbg_step else 0.0
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            if _dbg_step:
+                _t_preprocess_end = time.perf_counter()
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -4447,6 +4453,8 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if _dbg_step:
+                _t_forward_start = time.perf_counter()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4454,6 +4462,8 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if _dbg_step:
+                _t_forward_end = time.perf_counter()
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:

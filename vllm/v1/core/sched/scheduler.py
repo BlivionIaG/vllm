@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -438,6 +439,10 @@ class Scheduler(SchedulerInterface):
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
+        # RDNA investigation: log per-step token batch composition when env
+        # var is set. Used to confirm per-step overhead hypothesis.
+        if os.environ.get("VLLM_DBG_SCHED_STEPS") == "1":
+            self._dbg_sched_step_count = getattr(self, "_dbg_sched_step_count", 0) + 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
         # Each request just has the num_computed_tokens and
@@ -1227,6 +1232,17 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
+
+        # RDNA investigation: per-step token composition log (env-gated)
+        if os.environ.get("VLLM_DBG_SCHED_STEPS") == "1":
+            _num_reqs = len(num_scheduled_tokens)
+            _total_tok = total_num_scheduled_tokens
+            _is_prefill = any(r.is_prefill_chunk for r in self.running)
+            _per_req = sorted(num_scheduled_tokens.values())
+            logger.info(
+                "[sched-step] step=%d n_reqs=%d total_tok=%d is_prefill=%s per_req=%s",
+                self.current_step, _num_reqs, _total_tok, _is_prefill, _per_req,
+            )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
