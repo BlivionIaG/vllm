@@ -1994,7 +1994,7 @@ __global__ void fa_prefill_paged_varlen_splitk_reduce_kernel_128(
 }
 
 // HEAD_DIM = 256 split-K prefill kernel.
-__global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_256(
+__global__ __launch_bounds__(256, 1) void fa_prefill_paged_varlen_splitk_kernel_256(
     const half* __restrict__ Q,
     const half* __restrict__ key_cache,
     const half* __restrict__ value_cache,
@@ -2050,7 +2050,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
     for (int br = 0; br < br_size; ++br) {
       M_partial[partial_base_empty + br * (H_q * kv_splits)] = -INFINITY;
       L_partial[partial_base_empty + br * (H_q * kv_splits)] = 0.0f;
-      for (int d = t; d < 256; d += 128) {
+      for (int d = t; d < 256; d += 256) {
         O_partial[(partial_base_empty + br * (H_q * kv_splits)) * 256 + d] = 0.0f;
       }
     }
@@ -2077,7 +2077,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
 
   {
     const half* Q_row = Q + (q_start_global * stride_qo_tok + h_q * stride_qo_h);
-    for (int g = t; g < BR_PREFILL * 32; g += 128) {
+    for (int g = t; g < BR_PREFILL * 32; g += 256) {
       const int br = g / 32;
       const int dx = g % 32;
       uint4 q4 = make_uint4(0, 0, 0, 0);
@@ -2094,7 +2094,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
     sM[t] = -INFINITY;
     sL[t] = 0.0f;
   }
-  for (int i = t; i < BR_PREFILL * 256; i += 128) {
+  for (int i = t; i < BR_PREFILL * 256; i += 256) {
     sO[i] = 0.0f;
   }
   __syncthreads();
@@ -2121,7 +2121,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
       // (512B contiguous global) for one d_sub; padded rows keep the 16B
       // smem stores at <=4-way bank conflicts.
       constexpr int NX = 256 / 8;
-      for (int i = t; i < BC_256 * NX; i += 128) {
+      for (int i = t; i < BC_256 * NX; i += 256) {
         const int n_local = i % BC_256;
         const int d_sub = i / BC_256;
         if (n_local < blk_size) {
@@ -2136,7 +2136,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
       // V is slot-innermost: 8 consecutive slots contiguous per d.
       // Slot-group-fastest mapping: 64B contiguous global runs per warp.
       constexpr int NSG = BC_256 / 8;
-      for (int i = t; i < 256 * NSG; i += 128) {
+      for (int i = t; i < 256 * NSG; i += 256) {
         const int sg = i % NSG;
         const int d = i / NSG;
         const int n_local = sg * 8;
@@ -2169,7 +2169,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
         }
       }
     } else {
-      for (int i = t; i < BC_256 * 256; i += 128) {
+      for (int i = t; i < BC_256 * 256; i += 256) {
         const int n_local = i / 256;
         const int d = i % 256;
         if (n_local < blk_size) {
@@ -2190,7 +2190,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
     }
     __syncthreads();
 
-    for (int idx = t; idx < BR_PREFILL * BC_256; idx += 128) {
+    for (int idx = t; idx < BR_PREFILL * BC_256; idx += 256) {
       const int br = idx / BC_256;
       const int k = idx % BC_256;
       float acc = 0.0f;
@@ -2255,26 +2255,20 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
     }
     __syncthreads();
 
-    // PV: 128 threads × each owns 2 d-values (2*d_pair, 2*d_pair+1) via
-    // half2 LDS. Halves the LDS instruction count vs the prior scalar
-    // half-load (128*BR_PREFILL*BC_256 = 65536 LDS vs 131072 before).
-    // d_pair ranges [0, 128) so the union covers all 256 HEAD_DIM slots.
-    for (int idx = t; idx < BR_PREFILL * 128; idx += 128) {
-      const int br = idx / 128;
-      const int d_pair = idx % 128;
+    for (int idx = t; idx < BR_PREFILL * 256; idx += 256) {
+      const int br = idx / 256;
+      const int d = idx % 256;
       if (br < br_size) {
-        float pv_lo = 0.0f, pv_hi = 0.0f;
+        float pv = 0.0f;
         #pragma unroll
         for (int k = 0; k < BC_256; ++k) {
           if (k < blk_size) {
             float p_val = sP[br * BC_256 + k];
-            half2 v2 = *reinterpret_cast<half2*>(&sV[k * DSK + 2 * d_pair]);
-            pv_lo = fmaf(p_val, __low2float(v2), pv_lo);
-            pv_hi = fmaf(p_val, __high2float(v2), pv_hi);
+            float v_val = __half2float(sV[k * DSK + d]);
+            pv = fmaf(p_val, v_val, pv);
           }
         }
-        sO[br * 256 + 2 * d_pair] += pv_lo;
-        sO[br * 256 + 2 * d_pair + 1] += pv_hi;
+        sO[br * 256 + d] += pv;
       }
     }
     __syncthreads();
@@ -2292,7 +2286,7 @@ __global__ __launch_bounds__(128, 1) void fa_prefill_paged_varlen_splitk_kernel_
   }
   for (int br = 0; br < br_size; ++br) {
     const int64_t slot = partial_base + br * (H_q * kv_splits);
-    for (int d = t; d < 256; d += 128) {
+    for (int d = t; d < 256; d += 256) {
       O_partial[slot * 256 + d] = sO[br * 256 + d];
     }
   }
@@ -3749,7 +3743,7 @@ torch::Tensor fa_rdna2_prefill_paged_varlen_splitk(
         H_q * HEAD_DIM, HEAD_DIM, num_tokens);
   } else {
     constexpr int HEAD_DIM = 256;
-    constexpr int THREADS = 128;
+    constexpr int THREADS = 256;
     constexpr int BC_LOC = BC_256;
     dim3 grid(max_q_blocks, H_q, num_seqs * (int)kv_splits);
     dim3 block(THREADS);
