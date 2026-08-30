@@ -41,16 +41,11 @@ def _rdna2_w4a16_select_kernel(m: int, k: int, n: int) -> str:
     # on the table vs exllama. Used for full-HIP-path profiling.
     if os.environ.get("VLLM_FORCE_RDNA2_W4A16_HIP") == "1":
         return "rdna2_decode"
-    # M <= 32: decode/small-prefill band (K-gated). M <= 50: rdna2 prefill
-    # kernel. M > 50: both rdna2 kernels are flaky (nondeterministic wrong
-    # values on large shapes; see the M-sweep in
-    # docs/profiling/fa_rdna2-perf-analysis-2026-08-29.md) and exllama is
-    # fastest at M >= 512 anyway (rocBLAS-dense is compute-bound there).
     if m <= 32:
         if k >= 4096:
             return "rdna2_decode"
         return "prefill"
-    if m <= 50:
+    if m <= 128:
         return "prefill"
     return "exllama"
 

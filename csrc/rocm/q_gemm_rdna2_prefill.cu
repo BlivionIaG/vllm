@@ -416,14 +416,21 @@ inline void launch_for_config(
   const int lds_k_stride = ((k_per_split + LDS_PAD + 7) / 8) * 8;
   const size_t shmem = M_TILE * lds_k_stride * sizeof(half);
 
+  // Multi-split launch: deterministic two-phase epilogue. Each split
+  // writes disjoint fp32 partials; a fixed-order reduce kernel sums them
+  // to fp16, so the result cannot depend on block scheduling order.
+  // Allocate via the torch caching allocator, not hipMallocAsync:
+  // hipMallocAsync/hipFreeAsync buffer reuse on this stack (ROCm,
+  // gfx1030) corrupts the partials across back-to-back calls.
+  torch::Tensor partials_t;
   float* partials = nullptr;
   if (split_k > 1) {
-    // Multi-split launch: deterministic two-phase epilogue. Each split
-    // writes disjoint fp32 partials; a fixed-order reduce kernel sums them
-    // to fp16, so the result cannot depend on block scheduling order.
-    hipMallocAsync(reinterpret_cast<void**>(&partials),
-                   (size_t)split_k * (size_t)size_m * (size_t)size_n * sizeof(float),
-                   stream);
+    partials_t = torch::empty(
+        {static_cast<long>((size_t)split_k * size_m * size_n)},
+        torch::TensorOptions()
+            .dtype(torch::kFloat32)
+            .device(torch::Device(torch::kCUDA, c10::cuda::current_device())));
+    partials = partials_t.data_ptr<float>();
   }
 
   switch (k_per_split) {
@@ -458,7 +465,6 @@ inline void launch_for_config(
     const int rblock = 256;
     reduce_split_partials_kernel<><<<(total + rblock - 1) / rblock, rblock, 0,
                                      stream>>>(partials, c, size_m, size_n, split_k);
-    hipFreeAsync(partials, stream);
   }
 }
 

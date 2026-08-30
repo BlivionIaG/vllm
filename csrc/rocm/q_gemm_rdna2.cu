@@ -215,10 +215,16 @@ void launch_gemm_q4_for_mcount(const T* a, const uint32_t* b_q_weight,
   if (num_splits > 1) {
     // Multi-K-block launch: deterministic two-phase epilogue. Each split
     // writes fp32 partials; a fixed-order reduce sums them to fp16.
-    float* partials = nullptr;
-    hipMallocAsync(reinterpret_cast<void**>(&partials),
-                   (size_t)num_splits * size_m * size_n * sizeof(float),
-                   stream);
+    // Allocate via the torch caching allocator, not hipMallocAsync:
+    // hipMallocAsync/hipFreeAsync buffer reuse on this stack (ROCm,
+    // gfx1030) corrupts the partials across back-to-back calls —
+    // flaky wrong results on large M*N (missing K-split contributions).
+    auto partials_t = torch::empty(
+        {static_cast<long>((size_t)num_splits * size_m * size_n)},
+        torch::TensorOptions()
+            .dtype(torch::kFloat32)
+            .device(torch::Device(torch::kCUDA, c10::cuda::current_device())));
+    float* partials = partials_t.data_ptr<float>();
     gemm_q4_kernel_rdna2<T, M_COUNT><<<grid, block, 0, stream>>>(
         a, b_q_weight, b_qzeros, b_scales, c, size_m, size_n, size_k, groups,
         zero_offset, b_q_perm, partials);
@@ -227,7 +233,6 @@ void launch_gemm_q4_for_mcount(const T* a, const uint32_t* b_q_weight,
     reduce_split_partials_kernel<><<<(total + rblock - 1) / rblock, rblock, 0,
                                      stream>>>(partials, c, size_m, size_n,
                                                 num_splits);
-    hipFreeAsync(partials, stream);
   } else {
     // Single split: zero-initialized output + packed-fp16 atomic add is
     // a deterministic single-accumulator path (no order to race).

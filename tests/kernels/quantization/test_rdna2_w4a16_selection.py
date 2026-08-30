@@ -75,14 +75,15 @@ def test_choose_mp_linear_kernel_picks_triton_w4a16_for_uint4_asymmetric():
         (32, 512, 512, "prefill"),
         # M <= 32, K >= 4096 -> rdna2_decode (K-gated)
         (8, 4096, 512, "rdna2_decode"),
-        # 32 < M <= 50 -> prefill (rdna2 kernels proven correct to M=50)
+        # 32 < M <= 128 -> prefill (rdna2 prefill kernel; proven correct
+        # across the full-shape sweep, wins the band on timing)
         (40, 1024, 1024, "prefill"),
         (50, 5120, 8192, "prefill"),
-        # M > 50 -> exllama: rdna2 kernels are flaky past M=50; exllama is
-        # correct across the whole range and fastest at M >= 512 anyway.
-        (51, 5120, 34816, "exllama"),
-        (64, 1024, 1024, "exllama"),
-        (128, 1024, 4096, "exllama"),
+        (51, 5120, 34816, "prefill"),
+        (64, 1024, 1024, "prefill"),
+        (128, 1024, 4096, "prefill"),
+        # M > 128 -> exllama (compute-bound dense GEMM wins there)
+        (129, 5120, 8192, "exllama"),
         (300, 512, 2048, "exllama"),
         (1024, 1024, 1024, "exllama"),
         (2048, 5120, 8192, "exllama"),
