@@ -41,22 +41,18 @@ def _rdna2_w4a16_select_kernel(m: int, k: int, n: int) -> str:
     # on the table vs exllama. Used for full-HIP-path profiling.
     if os.environ.get("VLLM_FORCE_RDNA2_W4A16_HIP") == "1":
         return "rdna2_decode"
-    # M > 256: exllama is the clear winner for compute-bound GEMMs.
-    if m > 256:
-        return "exllama"
-    # 32 < M <= 256 (small prefill): N-dominant split.
-    # High N (>=3072) is the MLP gate/up projection shape where
-    # exllama is faster; otherwise decode wins (attention/down).
-    if m > 32:
-        if n >= 3072:
-            return "exllama"
-        return "rdna2_decode"
-    # M <= 32 (decode): K-dominant split.
-    # K >= 4096 means V_DOT2 (decode) is the right path; otherwise
-    # the tile-based prefill kernel is faster.
-    if k >= 4096:
-        return "rdna2_decode"
-    return "prefill"
+    # M <= 32: decode/small-prefill band (K-gated). M <= 50: rdna2 prefill
+    # kernel. M > 50: both rdna2 kernels are flaky (nondeterministic wrong
+    # values on large shapes; see the M-sweep in
+    # docs/profiling/fa_rdna2-perf-analysis-2026-08-29.md) and exllama is
+    # fastest at M >= 512 anyway (rocBLAS-dense is compute-bound there).
+    if m <= 32:
+        if k >= 4096:
+            return "rdna2_decode"
+        return "prefill"
+    if m <= 50:
+        return "prefill"
+    return "exllama"
 
 
 class RDNA2W4A16LinearKernel(MPLinearKernel):

@@ -206,9 +206,8 @@ def _assert_close(out: torch.Tensor, ref: torch.Tensor):
 # (M, K, N, G) and the bucket it routes to per _rdna2_w4a16_select_kernel:
 #   M <= 32, K < 4096                   -> prefill
 #   M <= 32, K >= 4096                  -> rdna2_decode (K-gated)
-#   32 < M <= 256, N < 3072             -> rdna2_decode (down-proj)
-#   32 < M <= 256, N >= 3072            -> exllama (gate/up-proj)
-#   M > 256                             -> exllama
+#   32 < M <= 50                        -> prefill
+#   M > 50                              -> exllama (rdna2 kernels flaky there)
 MKNG_SHAPES = [
     (1, 128, 128, 128),     # prefill (M <= 32, K < 4096)
     (2, 256, 256, 128),     # prefill
@@ -216,8 +215,12 @@ MKNG_SHAPES = [
     (8, 4096, 512, 128),    # rdna2_decode (K-gated)
     (16, 512, 256, 128),    # prefill
     (32, 512, 512, 64),     # prefill
-    (64, 1024, 1024, 128),  # rdna2_decode (32 < M <= 256, N < 3072)
+    (40, 5120, 8192, 128),  # prefill (32 < M <= 50 band, real shape)
+    (50, 5120, 8192, 128),  # prefill (band edge)
+    (51, 5120, 8192, 128),  # exllama (band edge + 1)
+    (64, 1024, 1024, 128),  # exllama (was rdna2_decode pre-fix)
     (300, 512, 2048, 128),  # exllama (M > 256)
+    (2048, 5120, 8192, 128),  # exllama (full prefill chunk, real shape)
 ]
 
 

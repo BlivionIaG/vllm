@@ -75,13 +75,17 @@ def test_choose_mp_linear_kernel_picks_triton_w4a16_for_uint4_asymmetric():
         (32, 512, 512, "prefill"),
         # M <= 32, K >= 4096 -> rdna2_decode (K-gated)
         (8, 4096, 512, "rdna2_decode"),
-        # 32 < M <= 256, N < 3072 -> rdna2_decode (down-proj / attention)
-        (64, 1024, 1024, "rdna2_decode"),
-        # 32 < M <= 256, N >= 3072 -> exllama (gate/up-proj)
+        # 32 < M <= 50 -> prefill (rdna2 kernels proven correct to M=50)
+        (40, 1024, 1024, "prefill"),
+        (50, 5120, 8192, "prefill"),
+        # M > 50 -> exllama: rdna2 kernels are flaky past M=50; exllama is
+        # correct across the whole range and fastest at M >= 512 anyway.
+        (51, 5120, 34816, "exllama"),
+        (64, 1024, 1024, "exllama"),
         (128, 1024, 4096, "exllama"),
-        # M > 256 -> exllama
         (300, 512, 2048, "exllama"),
         (1024, 1024, 1024, "exllama"),
+        (2048, 5120, 8192, "exllama"),
     ],
 )
 def test_rdna2_w4a16_inner_dispatch(M, K, N, expected):
