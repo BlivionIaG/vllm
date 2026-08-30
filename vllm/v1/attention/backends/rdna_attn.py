@@ -540,7 +540,7 @@ class RdnaAttentionImpl(AttentionImpl):
         # ------------------------------------------------------------------
         _num_seqs = seqused_k.size(0)
         _SPLITK_MIN_KV_SPLITS = 2
-        _kv_splits = min(16, (max_seqlen_k + 1023) // 1024)
+        _kv_splits = min(8, (max_seqlen_k + 1023) // 1024)
         _causal_attr = getattr(attn_metadata, "causal", True)
         if isinstance(_causal_attr, torch.Tensor):
             # fa_rdna2 kernels take one batch-wide causal flag.
