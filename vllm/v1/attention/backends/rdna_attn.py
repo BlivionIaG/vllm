@@ -759,8 +759,11 @@ class RdnaAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
-        if block_size % 16 != 0:
-            raise ValueError("Block size must be a multiple of 16.")
+        # FA-RDNA2 kernels take block_size as a runtime argument and
+        # accept any positive value. Vectorized K/V loads (faster path)
+        # require block_size % 8 == 0; non-multiples fall back to scalar.
+        if block_size < 1:
+            raise ValueError("Block size must be >= 1.")
         if cache_dtype_str == "int8_per_token_head":
             return (2, num_blocks, num_kv_heads, head_size + 4, block_size)
         return (2, num_blocks, num_kv_heads, head_size, block_size)

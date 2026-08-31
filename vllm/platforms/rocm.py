@@ -404,7 +404,11 @@ def use_rocm_custom_paged_attention(
             and (sliding_window == 0 or sliding_window == (-1, -1))
             and (qtype == torch.half or qtype == torch.bfloat16)
             and head_size in (128, 256)
-            and block_size == 16
+            # FA-RDNA2 kernels accept any block_size (passed as runtime arg).
+            # Vectorized K/V loads require block_size % 8 == 0 (Qwen3.5/3.8
+            # hybrids use 784/1056 which both satisfy this). Non-multiple-of-8
+            # falls back to scalar loads.
+            and block_size >= 1
             and (gqa_ratio >= 3 and gqa_ratio <= 16)
             and max_seq_len <= 128 * 1024
             and alibi_slopes is None
