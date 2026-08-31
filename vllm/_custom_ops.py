@@ -5,6 +5,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, Literal
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensor
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -948,6 +949,8 @@ def exl3_gemm_rdna2(
     bits: int,
     cb: int,
 ) -> None:
+    if isinstance(a, FakeTensor):
+        return  # dynamo trace: skip (FakeTensor side handled by register_fake)
     torch.ops._rocm_C.exl3_gemm_rdna2(
         a, c, trellis, size_m, size_n, size_k, bits, cb)
 
@@ -987,6 +990,8 @@ def moe_exl3_gemm_rdna2(
     bits: int,
     cb: int,
 ) -> None:
+    if isinstance(a, FakeTensor):
+        return  # dynamo trace: skip (FakeTensor side handled by register_fake)
     torch.ops._rocm_C.moe_exl3_gemm_rdna2(
         a, c, trellis, topk_weights, sorted_token_ids, expert_ids,
         num_tokens_post_padded, top_k, block_size_m, mul_topk_weight,
@@ -1029,6 +1034,8 @@ def exl3_hadamard_128(
 
     Outside the K-dot (wiki kernels/exl3.md). Port of exllamav3 had_r_128.
     """
+    if isinstance(input_tensor, FakeTensor):
+        return  # dynamo trace: skip (FakeTensor side handled by register_fake)
     torch.ops._rocm_C.exl3_hadamard_128(
         input_tensor, output, pre_scale, post_scale, scale)
 
