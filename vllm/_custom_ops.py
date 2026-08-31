@@ -943,16 +943,13 @@ def exl3_gemm_rdna2(
     a: torch.Tensor,
     c: torch.Tensor,
     trellis: torch.Tensor,
-    size_m: int,
-    size_n: int,
-    size_k: int,
     bits: int,
     cb: int,
 ) -> None:
     if isinstance(a, FakeTensor):
         return  # dynamo trace: skip (FakeTensor side handled by register_fake)
     torch.ops._rocm_C.exl3_gemm_rdna2(
-        a, c, trellis, size_m, size_n, size_k, bits, cb)
+        a, c, trellis, bits, cb)
 
 
 exl3_gemm_rdna2 = torch._dynamo.allow_in_graph(exl3_gemm_rdna2)
@@ -966,9 +963,6 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C,
         a: torch.Tensor,
         c: torch.Tensor,
         trellis: torch.Tensor,
-        size_m: int,
-        size_n: int,
-        size_k: int,
         bits: int,
         cb: int,
     ) -> None:
