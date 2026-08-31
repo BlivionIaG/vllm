@@ -952,6 +952,9 @@ def exl3_gemm_rdna2(
         a, c, trellis, size_m, size_n, size_k, bits, cb)
 
 
+exl3_gemm_rdna2 = torch.compiler.allow_in_graph(exl3_gemm_rdna2)
+
+
 if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C,
                                              "exl3_gemm_rdna2"):
 
@@ -990,6 +993,9 @@ def moe_exl3_gemm_rdna2(
         output_topk, bits, cb)
 
 
+moe_exl3_gemm_rdna2 = torch.compiler.allow_in_graph(moe_exl3_gemm_rdna2)
+
+
 if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C,
                                              "moe_exl3_gemm_rdna2"):
 
@@ -1025,6 +1031,9 @@ def exl3_hadamard_128(
     """
     torch.ops._rocm_C.exl3_hadamard_128(
         input_tensor, output, pre_scale, post_scale, scale)
+
+
+exl3_hadamard_128 = torch.compiler.allow_in_graph(exl3_hadamard_128)
 
 
 if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C,
