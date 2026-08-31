@@ -611,7 +611,6 @@ class Exl3LinearMethod(LinearMethodBase):
                   flush=True)
         return
 
-    @torch._dynamo.disable
     def apply(
         self,
         layer: torch.nn.Module,
