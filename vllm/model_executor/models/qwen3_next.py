@@ -662,6 +662,18 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
 
         full_num_tokens = positions.shape[-1]
+        # Unconditional slice: vLLM pre-allocates hidden_states to a size
+        # larger than full_num_tokens (max_num_batched_tokens * num_sequences
+        # for chunked prefill batching). Without this slice, the EXL3
+        # dispatcher receives (max_num_batched_tokens, hidden_size) and the
+        # HIP kernel reads into uninitialized padding pages, faulting at
+        # a bogus GPU address. The existing in-loop fix at line ~670 only
+        # runs for layers WITHOUT use_attn_reduce_scatter_for_moe; GDN
+        # layers (which use it) receive the full oversized buffer.
+        if hidden_states.shape[0] > full_num_tokens:
+            hidden_states = hidden_states[:full_num_tokens]
+        if residual is not None and residual.shape[0] > full_num_tokens:
+            residual = residual[:full_num_tokens]
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for layer_idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
