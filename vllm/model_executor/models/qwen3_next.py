@@ -662,6 +662,9 @@ class Qwen3NextModel(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
 
         full_num_tokens = positions.shape[-1]
+        import os as _exl3_os
+        if _exl3_os.environ.get("VLLM_EXL3_APPLY_DBG") == "1":
+            print(f"[qwen3_next.fwd] hidden_states.shape={tuple(hidden_states.shape)} full_num_tokens={full_num_tokens} positions.shape={tuple(positions.shape)} input_ids.shape={tuple(input_ids.shape) if input_ids is not None else None} inputs_embeds.shape={tuple(inputs_embeds.shape) if inputs_embeds is not None else None} prefix={self.__class__.__name__}", flush=True)
         # Unconditional slice: vLLM pre-allocates hidden_states to a size
         # larger than full_num_tokens (max_num_batched_tokens * num_sequences
         # for chunked prefill batching). Without this slice, the EXL3
