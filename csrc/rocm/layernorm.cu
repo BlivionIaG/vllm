@@ -162,6 +162,9 @@ static void launch_fused_add_rms_norm(const __half* in, __half* res,
                      stream, in, res, w, out, N, eps);
 }
 
+}  // namespace rocm_layernorm
+}  // namespace vllm
+
 // ---------------------------------------------------------------------------
 // Public C++ entry points (called from torch_bindings.cpp). Defined at global
 // scope so torch_bindings.cpp can register them unqualified, matching every
