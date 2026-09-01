@@ -40,7 +40,7 @@ __device__ __forceinline__ float block_reduce_sum(float local) {
   // 1. intra-warp reduce.
   #pragma unroll
   for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-    local += __shfl_xor_sync(0xFFFFFFFFu, local, offset);
+    local += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, local, offset);
   }
 
   // 2. cross-warp reduce via shared memory.
@@ -55,7 +55,7 @@ __device__ __forceinline__ float block_reduce_sum(float local) {
     float v = (threadIdx.x < NUM_WARPS) ? s_partial[threadIdx.x] : 0.0f;
     #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
-      v += __shfl_xor_sync(0xFFFFFFFFu, v, offset);
+      v += __shfl_xor_sync(0xFFFFFFFFFFFFFFFFull, v, offset);
     }
     if (threadIdx.x == 0) s_partial[0] = v;
   }
@@ -163,11 +163,15 @@ static void launch_fused_add_rms_norm(const __half* in, __half* res,
 }
 
 // ---------------------------------------------------------------------------
-// Public C++ entry points (called from torch_bindings.cpp).
+// Public C++ entry points (called from torch_bindings.cpp). Defined at global
+// scope so torch_bindings.cpp can register them unqualified, matching every
+// other _rocm_C op (gptq_gemm_rdna2, exl3_gemm_rdna2, fa_rdna2_decode_paged,
+// etc.).
 // ---------------------------------------------------------------------------
 
 void rms_norm(at::Tensor& out, const at::Tensor& input,
               const at::Tensor& weight, double epsilon) {
+  using namespace vllm::rocm_layernorm;
   TORCH_CHECK(input.is_cuda() && weight.is_cuda() && out.is_cuda(),
               "all tensors must be CUDA/HIP");
   TORCH_CHECK(input.scalar_type() == at::kHalf &&
@@ -215,6 +219,7 @@ void rms_norm(at::Tensor& out, const at::Tensor& input,
 
 void fused_add_rms_norm(at::Tensor& input, at::Tensor& residual,
                         const at::Tensor& weight, double epsilon) {
+  using namespace vllm::rocm_layernorm;
   TORCH_CHECK(input.is_cuda() && residual.is_cuda() && weight.is_cuda(),
               "all tensors must be CUDA/HIP");
   TORCH_CHECK(input.scalar_type() == at::kHalf &&
@@ -271,6 +276,3 @@ void fused_add_rms_norm(at::Tensor& input, at::Tensor& residual,
       break;
   }
 }
-
-}  // namespace rocm_layernorm
-}  // namespace vllm

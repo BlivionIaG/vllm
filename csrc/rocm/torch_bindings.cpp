@@ -346,13 +346,12 @@ TORCH_LIBRARY(_rocm_C, rocm_ops) {
   rocm_ops.def(
       "rms_norm(Tensor! out, Tensor input, Tensor weight, float epsilon) "
       "-> ()");
-  rocm_ops.impl("rms_norm", torch::kCUDA, &vllm::rocm_layernorm::rms_norm);
+  rocm_ops.impl("rms_norm", torch::kCUDA, &rms_norm);
 
   rocm_ops.def(
       "fused_add_rms_norm(Tensor! input, Tensor! residual, Tensor weight, "
       "float epsilon) -> ()");
-  rocm_ops.impl("fused_add_rms_norm", torch::kCUDA,
-                &vllm::rocm_layernorm::fused_add_rms_norm);
+  rocm_ops.impl("fused_add_rms_norm", torch::kCUDA, &fused_add_rms_norm);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
