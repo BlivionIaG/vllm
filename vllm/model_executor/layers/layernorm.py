@@ -121,6 +121,34 @@ class RMSNorm(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self.forward_cuda(x, residual)
 
+    def forward_rocm(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # RDNA path: dispatch to HIP AOT-compiled RMSNorm kernel instead of
+        # the upstream Triton `layer_norm_fwd_kernel`. The Triton path
+        # JIT-compiles per-shape on first call, which fires during inference
+        # if warmup didn't cover that exact shape — that invalidates the
+        # captured cudagraph and produces NaN. The HIP kernel is AOT-compiled,
+        # so cudagraph capture is stable.
+        from vllm import _custom_ops as ops
+
+        weight = self.weight.data if self.pass_weight else None
+        if residual is None:
+            assert weight is not None, (
+                "RDNA RMSNorm requires non-None weight")
+            out = torch.empty_like(x)
+            ops.rms_norm(out, x, weight, self.variance_epsilon)
+            return out
+        else:
+            weight_add = self.weight.data if self.pass_weight_add else None
+            assert weight_add is not None, (
+                "RDNA fused_add_rms_norm requires non-None weight")
+            ops.fused_add_rms_norm(x, residual, weight_add,
+                                    self.variance_epsilon)
+            return x, residual
+
     def extra_repr(self) -> str:
         s = f"hidden_size={self.weight.data.size(0)}"
         s += f", eps={self.variance_epsilon}"

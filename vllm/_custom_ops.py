@@ -233,7 +233,23 @@ def rms_norm(
     weight: torch.Tensor | None,
     epsilon: float,
 ) -> None:
-    torch.ops._C.rms_norm(out, input, weight, epsilon)
+    # Dispatch to HIP AOT-compiled kernel on RDNA (gfx1030/gfx1100) to avoid
+    # the upstream Triton `layer_norm_fwd_kernel` JIT-compile path, which
+    # breaks cudagraph capture on gfx1030 (warmup may not cover all shapes,
+    # so JIT fires during inference → captured graph references a kernel
+    # binary that no longer exists → NaN). The HIP kernel is AOT-compiled,
+    # stable across cudagraph replay. Falls through to the Triton path on
+    # CUDA / non-RDNA ROCm.
+    if (
+        weight is not None
+        and torch.cuda.is_available()
+        and torch.version.hip is not None
+        and hasattr(torch.ops, "_rocm_C")
+        and hasattr(torch.ops._rocm_C, "rms_norm")
+    ):
+        torch.ops._rocm_C.rms_norm(out, input, weight, epsilon)
+    else:
+        torch.ops._C.rms_norm(out, input, weight, epsilon)
 
 
 # LongCat n-gram embedding index kernel (see csrc/.../ngram_embedding_kernels.cu).
@@ -274,7 +290,16 @@ def fused_add_rms_norm(
     epsilon: float,
 ) -> None:
     # Note: this func is batch invariant
-    torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
+    if (
+        weight is not None
+        and torch.cuda.is_available()
+        and torch.version.hip is not None
+        and hasattr(torch.ops, "_rocm_C")
+        and hasattr(torch.ops._rocm_C, "fused_add_rms_norm")
+    ):
+        torch.ops._rocm_C.fused_add_rms_norm(input, residual, weight, epsilon)
+    else:
+        torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
 
 
 def fused_qk_norm_rope(

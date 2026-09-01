@@ -339,6 +339,20 @@ TORCH_LIBRARY(_rocm_C, rocm_ops) {
       "                Tensor? fp8_out_scale,"
       "                str mfma_type) -> ()");
   rocm_ops.impl("paged_attention", torch::kCUDA, &paged_attention);
+
+  // HIP RMSNorm / FusedAddRmsNorm — AOT-compiled, cudagraph-safe replacement
+  // for the upstream Triton layer_norm_fwd_kernel (which JIT-compiles per
+  // shape and breaks cudagraph capture on gfx1030). See csrc/rocm/layernorm.hip.
+  rocm_ops.def(
+      "rms_norm(Tensor! out, Tensor input, Tensor weight, float epsilon) "
+      "-> ()");
+  rocm_ops.impl("rms_norm", torch::kCUDA, &vllm::rocm_layernorm::rms_norm);
+
+  rocm_ops.def(
+      "fused_add_rms_norm(Tensor! input, Tensor! residual, Tensor weight, "
+      "float epsilon) -> ()");
+  rocm_ops.impl("fused_add_rms_norm", torch::kCUDA,
+                &vllm::rocm_layernorm::fused_add_rms_norm);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

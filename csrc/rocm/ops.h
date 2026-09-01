@@ -63,6 +63,21 @@ void paged_attention(
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type);
 
+// HIP RMSNorm / FusedAddRmsNorm for AMD RDNA (gfx1030/gfx1100). AOT-compiled,
+// cudagraph-safe replacement for the upstream Triton `layer_norm_fwd_kernel`
+// / `rms_norm_kernel` (which JIT-compile per-shape on first call and break
+// cudagraph capture on gfx1030). API-compatible with torch.ops._C.rms_norm /
+//
+// fused_add_rms_norm:
+//   rms_norm(out, input, weight, epsilon)
+//   fused_add_rms_norm(input, residual, weight, epsilon)
+// All tensors fp16. weight is 1D [N]. epsilon is fp64 (C++) but reduced to
+// fp32 inside. fp16 only.
+void rms_norm(torch::Tensor& out, const torch::Tensor& input,
+              const torch::Tensor& weight, double epsilon);
+void fused_add_rms_norm(torch::Tensor& input, torch::Tensor& residual,
+                        const torch::Tensor& weight, double epsilon);
+
 // FA-RDNA2: Flash-Attention v2 hand-port for AMD RDNA2 (gfx1030).
 // Dispatches a fast path inside RocmAttentionImpl.forward() for
 // decode (split-K) and prefill (paged varlen). Gated by
