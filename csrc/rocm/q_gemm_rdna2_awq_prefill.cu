@@ -186,7 +186,6 @@ __global__ __launch_bounds__(THREADS) void gemm_awq_prefill_kernel(
     // Group transitions are checked at K-block granularity; we require
     // groupsize >= BLOCK_K (caller enforces groupsize >= 32).
     const int group = k_block / groupsize;
-    const int next_group = (group + 1) * groupsize;
     // Refresh dequant constants for N_PER_THREAD columns at n0.
     // For threads with n0 + j >= size_n, we'll mask the contribution below.
     refresh_group<N_PER_THREAD>(group, n0, b_qzeros, b_scales, size_n,
@@ -312,14 +311,31 @@ __global__ void gemm_awq_prefill_kernel(
 // ---------------------------------------------------------------------------
 // Split-K computation.
 // ---------------------------------------------------------------------------
+// Local reduce kernel for split-K results. Same logic as the common
+// reduce_split_partials_kernel in q_gemm_rdna2_common.cuh, but defined
+// locally to avoid namespace issues when including from a nested
+// namespace.
+// ---------------------------------------------------------------------------
+__global__ void awq_reduce_split_partials_kernel(
+    const float* __restrict__ partials, half* __restrict__ c, int size_m,
+    int size_n, int num_splits) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = size_m * size_n;
+  if (idx >= total) return;
+  const int m = idx / size_n;
+  const int n = idx % size_n;
+  float acc = 0.0f;
+  for (int z = 0; z < num_splits; ++z) {
+    acc += partials[(z * size_m + m) * size_n + n];
+  }
+  c[idx] = __float2half_rn(acc);
+}
+
+// ---------------------------------------------------------------------------
 // Mirrors exllama's heuristic: split until LDS would exceed budget.
 // gfx1030 has 64 KiB LDS per block. We use 32 KiB to leave headroom.
 //
 inline int compute_split_k(int size_m, int size_n, int size_k) {
-  const int blocks_per_k_split =
-      ((size_m + BLOCK_M - 1) / BLOCK_M) *
-      ((size_n + BLOCK_N - 1) / BLOCK_N);
-
   auto lds_bytes = [&](int split) {
     const int k_per_split = size_k / split;
     const int row_stride = ((k_per_split + LDS_PAD + 7) / 8) * 8;
@@ -377,9 +393,9 @@ inline void launch_awq_prefill(
   if (split_k > 1) {
     const int total = size_m * size_n;
     const int rblock = 256;
-    reduce_split_partials_kernel<><<<(total + rblock - 1) / rblock, rblock, 0,
-                                     stream>>>(partials, c, size_m, size_n,
-                                                split_k);
+    awq_reduce_split_partials_kernel<<<
+        (total + rblock - 1) / rblock, rblock, 0, stream>>>(
+        partials, c, size_m, size_n, split_k);
   }
 }
 
@@ -428,9 +444,10 @@ torch::Tensor gptq_gemm_rdna2_awq_prefill(
   TORCH_CHECK(b_scales.size(0) == groups,
               "b_scales must have same group count as qzeros");
   TORCH_CHECK(b_scales.size(1) == size_n, "b_scales last dim must be N");
-  TORCH_CHECK(size_n % BLOCK_N == 0,
+  TORCH_CHECK(size_n % vllm::gptq_rdna2_awq_prefill::BLOCK_N == 0,
               "N must be a multiple of BLOCK_N for this kernel");
-  TORCH_CHECK(size_m % BLOCK_M == 0 || size_m <= BLOCK_M,
+  TORCH_CHECK(size_m % vllm::gptq_rdna2_awq_prefill::BLOCK_M == 0 ||
+                  size_m <= vllm::gptq_rdna2_awq_prefill::BLOCK_M,
               "M must be <= BLOCK_M or a multiple of it (no tail support yet)");
   TORCH_CHECK(size_k % 32 == 0, "K must be divisible by 32");
   TORCH_CHECK(groupsize >= 32, "group_size must be >= 32");

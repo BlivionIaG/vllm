@@ -34,6 +34,20 @@ from vllm.scalar_type import scalar_types
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 
+def _awq_prefill_available() -> bool:
+    """Check if the AWQ-native prefill kernel is registered.
+
+    hasattr(torch.ops._rocm_C, ...) is unreliable for torch ops because
+    dir() only shows 'name' for the namespace object. Use a direct
+    attribute access in a try/except instead.
+    """
+    try:
+        torch.ops._rocm_C.gptq_gemm_rdna2_awq_prefill
+        return True
+    except AttributeError:
+        return False
+
+
 def _rdna2_w4a16_select_kernel(
     m: int, k: int, n: int, is_awq: bool = False
 ) -> str:
@@ -48,15 +62,15 @@ def _rdna2_w4a16_select_kernel(
             return "rdna2_decode"
         return "prefill"
     if m <= 128:
+        if is_awq:
+            return "awq_prefill" if _awq_prefill_available() else "prefill"
         return "prefill"
     # AWQ (uint4, no bias) cannot use exllama — exllama is GPTQ-only and
     # always adds +1 to stored zeros (a GPTQ format quirk). Route AWQ to
     # the AWQ-native prefill kernel (exllama-clone tile structure) which
     # is optimized for high-M and is AWQ-correct.
     if is_awq:
-        if hasattr(ops, "gptq_gemm_rdna2_awq_prefill"):
-            return "awq_prefill"
-        return "prefill"
+        return "awq_prefill" if _awq_prefill_available() else "prefill"
     return "exllama"
 
 
