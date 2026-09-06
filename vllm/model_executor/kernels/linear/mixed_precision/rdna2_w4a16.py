@@ -50,10 +50,12 @@ def _rdna2_w4a16_select_kernel(
     if m <= 128:
         return "prefill"
     # AWQ (uint4, no bias) cannot use exllama — exllama is GPTQ-only and
-    # always adds +1 to stored zeros (a GPTQ format quirk). Fall through
-    # to our prefill kernel instead (slower for large M but correct).
-    # A future exllama-clone AWQ prefill kernel will replace this.
+    # always adds +1 to stored zeros (a GPTQ format quirk). Route AWQ to
+    # the AWQ-native prefill kernel (exllama-clone tile structure) which
+    # is optimized for high-M and is AWQ-correct.
     if is_awq:
+        if hasattr(ops, "gptq_gemm_rdna2_awq_prefill"):
+            return "awq_prefill"
         return "prefill"
     return "exllama"
 
@@ -268,7 +270,11 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
         # zero_offset=1). uint4b8 is GPTQv1; uint4 is AWQ.
         use_v2_format = (c.weight_type == scalar_types.uint4)
 
-        if kernel_name == "prefill" and hasattr(ops, "gptq_gemm_rdna2_prefill"):
+        if kernel_name == "awq_prefill" and hasattr(
+                ops, "gptq_gemm_rdna2_awq_prefill"):
+            output = ops.gptq_gemm_rdna2_awq_prefill(
+                x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+        elif kernel_name == "prefill" and hasattr(ops, "gptq_gemm_rdna2_prefill"):
             output = ops.gptq_gemm_rdna2_prefill(
                 x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
         elif kernel_name == "exllama" and hasattr(ops, "gptq_gemm"):
@@ -280,7 +286,13 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
             output = ops.gptq_gemm_rdna2(
                 x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
         else:
-            if hasattr(ops, "gptq_gemm"):
+            if hasattr(ops, "gptq_gemm_rdna2_awq_prefill") and use_v2_format:
+                output = ops.gptq_gemm_rdna2_awq_prefill(
+                    x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+            elif hasattr(ops, "gptq_gemm_rdna2_prefill"):
+                output = ops.gptq_gemm_rdna2_prefill(
+                    x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
+            elif hasattr(ops, "gptq_gemm"):
                 output = ops.gptq_gemm(
                     x_2d, w_q, w_zp, w_s, w_g_idx, True, use_v2_format,
                     c.weight_type.size_bits)
