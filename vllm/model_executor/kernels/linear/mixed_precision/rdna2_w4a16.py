@@ -42,7 +42,7 @@ def _awq_prefill_available() -> bool:
     attribute access in a try/except instead.
     """
     try:
-        torch.ops._rocm_C.gptq_gemm_rdna2_awq_prefill
+        torch.ops._rocm_C.awq_gemm_rdna2_prefill
         return True
     except AttributeError:
         return False
@@ -285,8 +285,8 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
         use_v2_format = (c.weight_type == scalar_types.uint4)
 
         if kernel_name == "awq_prefill" and hasattr(
-                ops, "gptq_gemm_rdna2_awq_prefill"):
-            output = ops.gptq_gemm_rdna2_awq_prefill(
+                ops, "awq_gemm_rdna2_prefill"):
+            output = ops.awq_gemm_rdna2_prefill(
                 x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
         elif kernel_name == "prefill" and hasattr(ops, "gptq_gemm_rdna2_prefill"):
             output = ops.gptq_gemm_rdna2_prefill(
@@ -300,8 +300,8 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
             output = ops.gptq_gemm_rdna2(
                 x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
         else:
-            if hasattr(ops, "gptq_gemm_rdna2_awq_prefill") and use_v2_format:
-                output = ops.gptq_gemm_rdna2_awq_prefill(
+            if hasattr(ops, "awq_gemm_rdna2_prefill") and use_v2_format:
+                output = ops.awq_gemm_rdna2_prefill(
                     x_2d, w_q, w_zp, w_s, w_g_idx, use_v2_format)
             elif hasattr(ops, "gptq_gemm_rdna2_prefill"):
                 output = ops.gptq_gemm_rdna2_prefill(

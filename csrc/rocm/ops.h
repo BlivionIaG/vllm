@@ -34,7 +34,7 @@ torch::Tensor gptq_gemm_rdna2_prefill(torch::Tensor a, torch::Tensor b_q_weight,
                                       torch::Tensor b_g_idx,
                                       bool use_v2_format);
 
-torch::Tensor gptq_gemm_rdna2_awq_prefill(
+torch::Tensor awq_gemm_rdna2_prefill(
     torch::Tensor a, torch::Tensor b_q_weight, torch::Tensor b_qzeros,
     torch::Tensor b_scales, torch::Tensor b_g_idx, bool use_v2_format);
 

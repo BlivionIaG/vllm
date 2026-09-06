@@ -417,7 +417,7 @@ inline void launch_awq_prefill(
 // Output:
 //   c         [M, N]            half
 //
-torch::Tensor gptq_gemm_rdna2_awq_prefill(
+torch::Tensor awq_gemm_rdna2_prefill(
     torch::Tensor a, torch::Tensor b_q_weight, torch::Tensor b_qzeros,
     torch::Tensor b_scales, torch::Tensor b_g_idx, bool use_v2_format) {
   TORCH_CHECK(a.is_cuda(), "a must be a CUDA/HIP tensor");
@@ -427,7 +427,7 @@ torch::Tensor gptq_gemm_rdna2_awq_prefill(
   TORCH_CHECK(a.dim() == 2, "a must be 2D [M, K]");
   TORCH_CHECK(b_q_weight.dim() == 2, "b_q_weight must be 2D [K/8, N]");
   TORCH_CHECK(a.scalar_type() == torch::kHalf,
-              "gptq_gemm_rdna2_awq_prefill only supports fp16");
+              "awq_gemm_rdna2_prefill only supports fp16");
   TORCH_CHECK(a.scalar_type() == b_scales.scalar_type(),
               "b_scales dtype must match a");
 
@@ -452,7 +452,7 @@ torch::Tensor gptq_gemm_rdna2_awq_prefill(
   TORCH_CHECK(size_k % 32 == 0, "K must be divisible by 32");
   TORCH_CHECK(groupsize >= 32, "group_size must be >= 32");
   TORCH_CHECK(use_v2_format,
-              "gptq_gemm_rdna2_awq_prefill is AWQ-only (use_v2_format must be True)");
+              "awq_gemm_rdna2_prefill is AWQ-only (use_v2_format must be True)");
 
   auto c = torch::zeros({size_m, size_n}, a.options());
   const at::cuda::OptionalCUDAGuard device_guard(device_of(a));

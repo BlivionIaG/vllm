@@ -70,11 +70,11 @@ TORCH_LIBRARY(_rocm_C, rocm_ops) {
   // block_n=64, block_k=32) but AWQ-native (zero_offset=0, no GPTQv1 +1 quirk).
   // Used for chunked prefill (M=128) and full prefill (M=2048) on AWQ models.
   rocm_ops.def(
-      "gptq_gemm_rdna2_awq_prefill(Tensor a, Tensor b_q_weight, "
+      "awq_gemm_rdna2_prefill(Tensor a, Tensor b_q_weight, "
       "Tensor b_qzeros, Tensor b_scales, Tensor b_g_idx, "
       "bool use_v2_format) -> Tensor");
-  rocm_ops.impl("gptq_gemm_rdna2_awq_prefill", torch::kCUDA,
-                &gptq_gemm_rdna2_awq_prefill);
+  rocm_ops.impl("awq_gemm_rdna2_prefill", torch::kCUDA,
+                &awq_gemm_rdna2_prefill);
 
   // FA-RDNA2: Flash-Attention v2 hand-port for AMD RDNA2 (gfx1030).
   // Dispatched via a fast path in RocmAttentionImpl.forward().
