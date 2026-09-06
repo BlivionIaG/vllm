@@ -34,7 +34,9 @@ from vllm.scalar_type import scalar_types
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
 
 
-def _rdna2_w4a16_select_kernel(m: int, k: int, n: int) -> str:
+def _rdna2_w4a16_select_kernel(
+    m: int, k: int, n: int, is_awq: bool = False
+) -> str:
     # Force every GEMM through the RDNA2 HIP kernel (V_DOT2 path) when the
     # env override is set. gptq_gemm_rdna2 tiles any M via M_COUNT∈{1,2,4,8}
     # so it is correct for prefill too; it just leaves large-M throughput
@@ -46,6 +48,12 @@ def _rdna2_w4a16_select_kernel(m: int, k: int, n: int) -> str:
             return "rdna2_decode"
         return "prefill"
     if m <= 128:
+        return "prefill"
+    # AWQ (uint4, no bias) cannot use exllama — exllama is GPTQ-only and
+    # always adds +1 to stored zeros (a GPTQ format quirk). Fall through
+    # to our prefill kernel instead (slower for large M but correct).
+    # A future exllama-clone AWQ prefill kernel will replace this.
+    if is_awq:
         return "prefill"
     return "exllama"
 
@@ -248,7 +256,8 @@ class RDNA2W4A16LinearKernel(MPLinearKernel):
         m = x_2d.size(0)
         k = x_2d.size(1)
         n = c.partition_weight_shape[1]
-        kernel_name = _rdna2_w4a16_select_kernel(m, k, n)
+        is_awq = (c.weight_type == scalar_types.uint4)
+        kernel_name = _rdna2_w4a16_select_kernel(m, k, n, is_awq=is_awq)
 
         if os.environ.get("VLLM_LOG_W4A16_DISPATCH") == "1" and not torch.compiler.is_compiling():
             print(f"[w4a16] M={m} K={k} N={n} -> {kernel_name}", flush=True)
